@@ -1,3 +1,4 @@
+// Build version: 2026-09-19-build-1 (Routes updated for secret prefix with 888)
 let detailsStatus = "idle";
 // idle | processing | done | stopped | failed
 
