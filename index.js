@@ -1,7 +1,8 @@
-// Build version: 2026-09-19-build-2 (Role-based Authentication for Admin, Kata, and Gabor)
+// Build version: 2026-09-19-build-3 (Lodgify v2 integration, 5-min sync cooldown, working view switching & logout)
 let detailsStatus = "idle";
-// idle | processing | done | stopped | failed
+// idle | processing | done | failed
 
+// --------------------- Authentication ---------------------
 function authenticateUser(request) {
   const authHeader = request.headers.get("Authorization");
   if (!authHeader || !authHeader.startsWith("Basic ")) {
@@ -37,7 +38,7 @@ function authenticateUser(request) {
       return { role: "golf-del-sur", username: "Gábor (Golf-del-Sur)" };
     }
 
-    // Fallback ha csak a jelszó egyezik egyértelműen
+    // Fallback ha a jelszó egyértelműen stimmel
     if (pass === "Kurvaanyad1!") return { role: "admin", username: rawUser || "Admin" };
     if (pass === "Kata1!") return { role: "la-arena", username: "Kata (La-Arena)" };
     if (pass === "Gabor1!") return { role: "golf-del-sur", username: "Gábor (Golf-del-Sur)" };
@@ -48,8 +49,8 @@ function authenticateUser(request) {
   }
 }
 
-function unauthorizedResponse() {
-  return new Response("Access Denied: Authentication required.", {
+function unauthorizedResponse(msg = "Access Denied: Authentication required.") {
+  return new Response(msg, {
     status: 401,
     headers: {
       "WWW-Authenticate": 'Basic realm="Cleaning Calendar", charset="UTF-8"',
@@ -58,380 +59,390 @@ function unauthorizedResponse() {
   });
 }
 
+// --------------------- Cooldown & Rate Limiting ---------------------
+async function checkSyncCooldown(env) {
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE name = 'LAST_SYNC_TIME'").first();
+    if (!row || !row.value) return { allowed: true };
+    const lastSyncMs = new Date(row.value).getTime();
+    if (isNaN(lastSyncMs)) return { allowed: true };
+    const elapsedSec = Math.floor((Date.now() - lastSyncMs) / 1000);
+    const cooldownSec = 300; // 5 perc cooldown
+    if (elapsedSec < cooldownSec) {
+      const remainingSec = cooldownSec - elapsedSec;
+      const mins = Math.floor(remainingSec / 60);
+      const secs = remainingSec % 60;
+      const timeStr = mins > 0 ? `${mins} perc ${secs} mp` : `${secs} mp`;
+      return { allowed: false, remainingSec, timeStr, lastSyncIso: row.value };
+    }
+    return { allowed: true, lastSyncIso: row.value };
+  } catch (e) {
+    return { allowed: true };
+  }
+}
+
+async function markSyncDone(env) {
+  try {
+    const nowIso = new Date().toISOString();
+    await env.DB.prepare(
+      "INSERT INTO settings (name, value) VALUES ('LAST_SYNC_TIME', ?) ON CONFLICT(name) DO UPDATE SET value=excluded.value"
+    ).bind(nowIso).run();
+  } catch (e) {
+    console.error("Failed to mark sync done:", e);
+  }
+}
+
+// --------------------- Main Worker Export ---------------------
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const pathname = url.pathname;
-    const view = url.searchParams.get("view");
-    const host = request.headers.get('host') || 'worker.default.tld';
+    try {
+      const url = new URL(request.url);
+      const pathname = url.pathname;
+      const view = url.searchParams.get("view");
+      const action = url.searchParams.get("action");
+      const host = request.headers.get('host') || 'worker.default.tld';
 
-    // --- ICAL ROUTES VISSZAÁLLÍTVA (TOKEN NÉLKÜL - Naptár szinkronizációhoz publikus) ---
-    if (pathname === "/golf-del-sur-ical") {
-      return await serveIcalFeed(env, ["The Tucan", "The Colibri", "The Albatros"], "Golf-del-Sur-Columns", host);
-    }
-    if (pathname === "/la-arena-ical") {
-      return await serveIcalFeed(env, ["The Banana", "The Pirate"], "La-Arena-Columns", host);
-    }
-    // -------------------------------------------------------------------------------------
-
-    // HTTP Basic Authentication ellenőrzése
-    const auth = authenticateUser(request);
-    if (!auth) {
-      return unauthorizedResponse();
-    }
-
-    // 1. Szerepkör: Kata (La-Arena) -> Kizárólag Banana és Pirate apartmanok
-    if (auth.role === "la-arena") {
-      return await serveTable(env, ["The Banana", "The Pirate"], "La-Arena", auth);
-    }
-
-    // 2. Szerepkör: Gábor (Golf-del-Sur) -> Kizárólag Tucan, Colibri, Albatros apartmanok
-    if (auth.role === "golf-del-sur") {
-      return await serveTable(env, ["The Tucan", "The Colibri", "The Albatros"], "Golf-del-Sur", auth);
-    }
-
-    // 3. Szerepkör: Admin -> Teljes hozzáférés
-    if (pathname === "/update") {
-      try {
-        await logIssue(env, "Starting full sync (Past/Future) and detail fetch for all missing entries.");
-        detailsStatus = "processing";
-        const allBookingIds = await updateAllBookings(env); 
-        ctx.waitUntil(startDetailedFetch(env));
-        return new Response("✅ Full bookings sync complete. Detailed fetch for missing entries is running in the background.", {
-          status: 200
-        });
-      } catch (err) {
-        detailsStatus = "failed";
-        await logIssue(env, `Update failed globally: ${err.message}`);
-        return new Response("Update failed: " + err.message, {
-          status: 500
-        });
+      // --- ICAL ROUTES (TOKEN NÉLKÜL - Naptár szinkronizációhoz publikus) ---
+      if (pathname === "/golf-del-sur-ical" || action === "golf-del-sur-ical") {
+        return await serveIcalFeed(env, ["The Tucan", "The Colibri", "The Albatros"], "Golf-del-Sur-Columns", host);
       }
-    }
+      if (pathname === "/la-arena-ical" || action === "la-arena-ical") {
+        return await serveIcalFeed(env, ["The Banana", "The Pirate"], "La-Arena-Columns", host);
+      }
+      // ---------------------------------------------------------------------
 
-    if (pathname === "/save-settings" && request.method === "POST") {
-      return handleSettingsPost(request, env);
-    }
+      // Kijelentkezés (Basic Auth böngésző cache törlése)
+      if (action === "logout" || pathname === "/logout") {
+        return unauthorizedResponse("Sikeresen kijelentkeztél. Újbóli belépéshez töltsd újra az oldalt vagy add meg az új bejelentkezési adatokat.");
+      }
 
-    if (pathname === "/logs" || view === "logs") {
-      return await serveLogs(env);
-    }
+      // HTTP Basic Authentication ellenőrzése
+      const auth = authenticateUser(request);
+      if (!auth) {
+        return unauthorizedResponse();
+      }
 
-    if (pathname === "/la-arena" || view === "la-arena") {
-      return await serveTable(env, ["The Banana", "The Pirate"], "La-Arena", auth);
-    }
+      // Szinkronizáció (Sync) indítása (Admin és bejelentkezett takarítók is futtathatják, 5 perc cooldownnal)
+      if (pathname === "/update" || action === "update") {
+        const cooldown = await checkSyncCooldown(env);
+        if (!cooldown.allowed) {
+          return new Response(`⏳ A naptár nemrég frissült. Újabb frissítés ${cooldown.timeStr} múlva indítható.`, {
+            status: 429,
+            headers: { "Content-Type": "text/plain; charset=utf-8" }
+          });
+        }
 
-    if (pathname === "/golf-del-sur" || view === "golf-del-sur") {
-      return await serveTable(env, ["The Tucan", "The Colibri", "The Albatros"], "Golf-del-Sur", auth);
-    }
+        try {
+          await logIssue(env, `Sync manually initiated by ${auth.username}.`);
+          detailsStatus = "processing";
+          const result = await updateAllBookings(env);
+          await markSyncDone(env);
+          detailsStatus = "done";
+          return new Response(`✅ Szinkronizálás sikeres! (${result.count} foglalás frissítve - ${result.version})`, {
+            status: 200,
+            headers: { "Content-Type": "text/plain; charset=utf-8" }
+          });
+        } catch (err) {
+          detailsStatus = "failed";
+          await logIssue(env, `Sync update failed: ${err.message}`);
+          return new Response("Hiba a szinkronizálás során: " + err.message, {
+            status: 500,
+            headers: { "Content-Type": "text/plain; charset=utf-8" }
+          });
+        }
+      }
 
-    // Alapértelmezett nézet Adminnak: All Bookings
-    return await serveTable(env, [], "All Bookings", auth);
+      // Beállítások mentése (csak Admin)
+      if ((pathname === "/save-settings" || action === "save-settings") && request.method === "POST") {
+        if (auth.role !== "admin") {
+          return new Response("Unauthorized", { status: 403 });
+        }
+        return handleSettingsPost(request, env);
+      }
+
+      // Rendszernaplók megtekintése (csak Admin)
+      if (pathname === "/logs" || view === "logs") {
+        if (auth.role !== "admin") {
+          return new Response("Unauthorized", { status: 403 });
+        }
+        return await serveLogs(env, auth);
+      }
+
+      // 1. Szerepkör: Kata (La-Arena) -> Kizárólag Banana és Pirate apartmanok
+      if (auth.role === "la-arena") {
+        return await serveTable(env, ["The Banana", "The Pirate"], "La-Arena (Kata)", auth, host);
+      }
+
+      // 2. Szerepkör: Gábor (Golf-del-Sur) -> Kizárólag Tucan, Colibri, Albatros apartmanok
+      if (auth.role === "golf-del-sur") {
+        return await serveTable(env, ["The Tucan", "The Colibri", "The Albatros"], "Golf-del-Sur (Gábor)", auth, host);
+      }
+
+      // 3. Szerepkör: Admin -> Dinamikus szűrés a nézetek között
+      if (pathname === "/la-arena" || view === "la-arena") {
+        return await serveTable(env, ["The Banana", "The Pirate"], "La-Arena (Kata)", auth, host);
+      }
+
+      if (pathname === "/golf-del-sur" || view === "golf-del-sur") {
+        return await serveTable(env, ["The Tucan", "The Colibri", "The Albatros"], "Golf-del-Sur (Gábor)", auth, host);
+      }
+
+      // Alapértelmezett nézet Adminnak: Összes apartman (All Bookings)
+      return await serveTable(env, [], "All Bookings", auth, host);
+    } catch (err) {
+      await logIssue(env, `Uncaught error in fetch handler: ${err.message}\nStack: ${err.stack}`);
+      return new Response(`Uncaught Exception: ${err.message}\n\nStack:\n${err.stack}`, {
+        status: 500,
+        headers: { "Content-Type": "text/plain; charset=utf-8" }
+      });
+    }
   },
-  
-  // CRON: Cron Trigger Handler (Clears logs on minute 0 run)
+
+  // CRON trigger
   async scheduled(event, env, ctx) {
     const runTime = new Date(event.scheduledTime);
     const isMainRun = runTime.getUTCMinutes() === 0;
 
     if (isMainRun) {
-        ctx.waitUntil(env.DB.prepare("DELETE FROM logs WHERE timestamp < datetime('now', '-7 days')").run());
-        ctx.waitUntil(logIssue(env, `*** Log Cleanup Triggered (Older than 7 days) ***`));
+      ctx.waitUntil(env.DB.prepare("DELETE FROM logs WHERE timestamp < datetime('now', '-7 days')").run());
+      ctx.waitUntil(logIssue(env, `*** Log Cleanup Triggered (Older than 7 days) ***`));
     }
-    
-    ctx.waitUntil(logIssue(env, `Cron trigger received at minute ${runTime.getUTCMinutes()}. Starting automated sync.`));
+
+    ctx.waitUntil(logIssue(env, `Automated Cron sync started at ${runTime.toISOString()}.`));
     try {
       await updateAllBookings(env);
-      ctx.waitUntil(startDetailedFetch(env));
+      await markSyncDone(env);
     } catch (err) {
       ctx.waitUntil(logIssue(env, `Automated Cron Update failed: ${err.message}`));
     }
-  },
+  }
 };
 
-// --------------------- Email (kept for context) --------------------
-async function sendEmail(env, to, subject, htmlBody) {
-  const apiKey = env.MAILJET_API_KEY; 
-  const secretKey = env.MAILJET_SECRET_KEY; 
-  const body = {
-    Messages: [{
-      From: {
-        Email: "ferkomes@gmail.com",
-        Name: "Cleaning Scheduler"
-      },
-      To: [{
-        Email: to
-      }],
-      Subject: subject,
-      HTMLPart: htmlBody
-    }]
-  };
-  const response = await fetch("https://api.mailjet.com/v3.1/send", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": "Basic " + btoa(`${apiKey}:${secretKey}`)
-    },
-    body: JSON.stringify(body)
-  });
-  const result = await response.json();
-  console.log("Mailjet send result:", result);
-}
-
-// --------------------- update all recent bookings (Conditional Reset Logic) ---------------------
+// --------------------- Lodgify API Integration (v2 Elsődleges, v1 Biztonsági tartalék) ---------------------
 async function updateAllBookings(env) {
   const apiKey = env.LODGIFY_API_KEY;
-  if (!apiKey) throw new Error("LODGIFY_API_KEY not set");
+  if (!apiKey) throw new Error("LODGIFY_API_KEY nincs beállítva!");
 
-  const baseApiUrl = "https://api.lodgify.com/v1/reservation";
   const headers = {
     "X-ApiKey": apiKey,
     "Accept": "application/json"
   };
 
-  const thirtyTwoDaysAgo = new Date();
-  thirtyTwoDaysAgo.setDate(thirtyTwoDaysAgo.getDate() - 32);
-  const sixMonthsAhead = new Date(new Date().setMonth(new Date().getMonth() + 3));
+  // 1. Apartman nevek előre definiált statikus térképe (nem terheli felesleges API hívással a Lodgify-t)
+  const propertiesMap = {
+    414841: "The Banana",
+    414842: "The Pirate",
+    414843: "The Tucan",
+    414844: "The Colibri",
+    414845: "The Albatros"
+  };
 
-  const periodStart = thirtyTwoDaysAgo.toISOString().slice(0, 10);
+  // 2. Lodgify v2 Bookings API: Minden adatot egyben visszaad (check_in.time, check_out.time, notes, key_code, guest)
+  try {
+    let page = 1;
+    const size = 50;
+    let totalProcessed = 0;
+
+    while (page <= 10) {
+      const v2Url = `https://api.lodgify.com/v2/reservations/bookings?page=${page}&size=${size}&trash=False`;
+      let resp = await fetch(v2Url, { headers });
+
+      let retries = 0;
+      while (resp.status === 429 && retries < 4) {
+        const retryAfterHeader = resp.headers.get('Retry-After');
+        const waitMs = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : 3500 * (retries + 1);
+        await logIssue(env, `Lodgify 429 rate limit. Waiting ${waitMs}ms before retry #${retries + 1}...`);
+        await delay(waitMs);
+        resp = await fetch(v2Url, { headers });
+        retries++;
+      }
+
+      if (!resp.ok) {
+        throw new Error(`v2 API returned HTTP ${resp.status}`);
+      }
+
+      const data = await resp.json();
+      const items = data?.items || (Array.isArray(data) ? data : []);
+      if (!items || items.length === 0) {
+        break;
+      }
+
+      // Szűrés: Csak az aktív 'Booked' állapotú foglalások
+      const mappedRows = items
+        .filter(item => {
+          const status = (item.status || "").toLowerCase();
+          return status === "booked" && !item.is_deleted && !item.canceled_at;
+        })
+        .map(item => mapBookingV2(item, propertiesMap));
+
+      if (mappedRows.length) {
+        await batchUpsertBookingsV2(env, mappedRows);
+        totalProcessed += mappedRows.length;
+      }
+
+      if (items.length < size) {
+        break; // Utolsó oldal
+      }
+
+      page++;
+      await delay(200); // Rövid szünet a lapozások között
+    }
+
+    await logIssue(env, `✅ Lodgify v2 sync complete: ${totalProcessed} bookings updated across ${page} page(s).`);
+    return { success: true, count: totalProcessed, version: "v2" };
+  } catch (v2Err) {
+    await logIssue(env, `Lodgify v2 sync failed (${v2Err.message}). Starting v1 fallback sync...`);
+  }
+
+  // 3. Biztonsági tartalék (v1 Fallback)
+  return await updateAllBookingsV1Fallback(env, propertiesMap);
+}
+
+// --------------------- Lodgify v1 Fallback ---------------------
+async function updateAllBookingsV1Fallback(env, propertiesMap) {
+  const apiKey = env.LODGIFY_API_KEY;
+  const baseApiUrl = "https://api.lodgify.com/v1/reservation";
+  const headers = { "X-ApiKey": apiKey, "Accept": "application/json" };
+
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  const sixMonthsAhead = new Date();
+  sixMonthsAhead.setMonth(sixMonthsAhead.getMonth() + 6);
+
+  const periodStart = thirtyDaysAgo.toISOString().slice(0, 10);
   const periodEnd = sixMonthsAhead.toISOString().slice(0, 10);
 
   let offset = 0;
   const limit = 50;
-  const allBookingIds = [];
-  
-  const pendingCountResult = await env.DB.prepare(
-      "SELECT COUNT(booking_id) as count FROM bookings WHERE detail_status = 'PENDING'"
-  ).first();
-  const allPendingCleared = pendingCountResult.count === 0; 
-  const shouldResetAllStatus = allPendingCleared;
-  
-  await logIssue(env, `Pending check: ${pendingCountResult.count} bookings are PENDING. Reset All Status: ${shouldResetAllStatus}`);
+  let totalBookings = 0;
 
-
-  while (true) {
+  while (offset < 300) {
     const url = `${baseApiUrl}?offset=${offset}&limit=${limit}&trash=false&periodStart=${periodStart}&periodEnd=${periodEnd}`;
-    
     let resp = await fetch(url, { headers });
+
     let retries = 0;
-    while (resp.status === 429 && retries < 5) {
-      const retryAfterHeader = resp.headers.get('Retry-After');
-      const waitMs = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : 3000 * (retries + 1);
-      await logIssue(env, `Lodgify 429 rate limit hit (offset=${offset}). Waiting ${waitMs}ms before retry #${retries + 1}.`);
-      await delay(waitMs);
+    while (resp.status === 429 && retries < 3) {
+      await delay(2500 * (retries + 1));
       resp = await fetch(url, { headers });
       retries++;
     }
-    
-    if (!resp.ok) throw new Error(`API fetch failed with status: ${resp.status}`);
+
+    if (!resp.ok) break;
     const data = await resp.json();
-    
-    await delay(300); // JAVÍTVA: kis szünet két lapozás között, hogy ne pörögjön túl gyorsan
-    if (!data || !data.items || data.items.length === 0) break;
+    if (!data || !data.items || !data.items.length) break;
+
     const items = data.items;
-    const fetchedIds = items.map(item => item.id);
-    allBookingIds.push(...fetchedIds.map(String));
-    
-    // MODIFICATION START
-    // Filter to only include 'booked' status AND no cancellation date
-    const batchRows = items.filter(item => 
-      item.status?.toLowerCase() === "booked" && 
-      !item.cancellationDate
-    ).map(mapBooking);
-    // MODIFICATION END
-    
-    if (batchRows.length) await batchUpsertBookings(env, batchRows, 5, shouldResetAllStatus);
-    
+    const batchRows = items
+      .filter(item => item.status?.toLowerCase() === "booked" && !item.cancellationDate)
+      .map(mapBooking);
+
+    if (batchRows.length) {
+      await batchUpsertBookingsV2(env, batchRows);
+      totalBookings += batchRows.length;
+    }
+
     if (items.length < limit) break;
     offset += limit;
+    await delay(250);
   }
-  
-  return allBookingIds; 
+
+  await logIssue(env, `v1 fallback sync completed: ${totalBookings} bookings.`);
+  return { success: true, count: totalBookings, version: "v1-fallback" };
 }
 
-// --------------------- Start Detailed Fetch (Process All Missing Details) ---------------------
-async function startDetailedFetch(env) {
-    const apiKey = env.LODGIFY_API_KEY;
-    const detailApiUrl = "https://api.lodgify.com/v1/reservation/booking/";
-    const headers = { "X-ApiKey": apiKey, "Accept": "application/json" };
-    
-    const bookingsNeedingDetails = await env.DB.prepare(
-        "SELECT * FROM bookings WHERE detail_status = 'PENDING'"
-    ).all();
-    
-    const now = new Date();
-    const currentAndUpcoming = [];
-    const past = [];
+// --------------------- Mapping and Batch Upsert ---------------------
+function mapBookingV2(item, propertiesMap) {
+  const guest = item.guest || {};
+  const room = (item.rooms && item.rooms[0]) || {};
+  const breakdown = room.guest_breakdown || {};
+  const people = [
+    breakdown.adults ? `${breakdown.adults} adult${breakdown.adults > 1 ? "s" : ""}` : "",
+    breakdown.children ? `${breakdown.children} child${breakdown.children > 1 ? "ren" : ""}` : "",
+    breakdown.infants ? `${breakdown.infants} infant${breakdown.infants > 1 ? "s" : ""}` : ""
+  ].filter(Boolean).join(", ");
 
-    for (const booking of bookingsNeedingDetails.results) {
-        const departure = new Date(booking.departure);
-        if (departure >= now) { 
-            currentAndUpcoming.push(booking);
-        } else {
-            past.push(booking);
-        }
-    }
-    
-    currentAndUpcoming.sort((a, b) => new Date(a.check_in_date) - new Date(b.check_in_date));
-    past.sort((a, b) => new Date(b.departure) - new Date(a.departure));
+  const guestPhone = guest.phone || "";
+  const rawLockbox = String(guestPhone).replace(/[^0-9]/g, '');
+  const lockboxFromPhone = rawLockbox.slice(-4) || "";
+  const lockboxCode = room.key_code || lockboxFromPhone || "";
 
-    const allIdsToFetch = [
-        ...currentAndUpcoming.map(b => String(b.booking_id)),
-        ...past.map(b => String(b.booking_id))
-    ];
-    
-    const limitedIdsToFetch = allIdsToFetch; 
-    
-    await logIssue(env, `Starting detailed fetch for ${limitedIdsToFetch.length} bookings missing details. Processing all, first come first served.`);
-    
-    let successfulRequests = 0;
-    for (const rawId of limitedIdsToFetch) {
-        const id = parseInt(rawId, 10);
-        if (isNaN(id)) {
-            await logIssue(env, `Skipping invalid booking ID: ${rawId}`, rawId);
-            continue;
-        }
-        
-        await delay(100); 
+  const propName = propertiesMap[item.property_id] || item.property_name || `Property #${item.property_id}`;
+  const checkInTime = item.check_in?.time || "";
+  const checkOutTime = item.check_out?.time || "";
+  const note = item.notes ? cleanNote(item.notes) : "";
 
-        const url = `${detailApiUrl}${id}`; 
-        
-        try {
-          const resp = await fetch(url, { headers });
-          
-          if (!resp.ok) {
-            if (resp.status === 404) {
-              await logIssue(env, `API returned status 404 for booking ID ${id}. Assuming removed.`, id);
-              
-              await env.DB.prepare(
-                  `UPDATE bookings SET detail_status='DONE' WHERE booking_id=?`
-              )
-              .bind(id)
-              .run();
-
-            } else if (resp.status === 429 || resp.status >= 500) {
-              await logIssue(env, `Rate/Subrequest error (status ${resp.status}) for ${id}. Skipping to next priority.`, id);
-            } else {
-              await logIssue(env, `API returned status ${resp.status} for booking ID ${id}.`, id);
-            }
-            continue;
-          }
-
-          const booking = await resp.json();
-          if (!booking) {
-            await logIssue(env, `Empty response for booking ID ${id}.`, id);
-            continue;
-          }
-
-          const checkInTime = booking.check_in?.time || "";
-          const checkOutTime = booking.check_out?.time || "";
-          const note = booking.note ? cleanNote(booking.note) : "";
-          
-          await logIssue(env, `Fetched details. Notes: ${!!note ? 'YES' : 'NO'}, Time: ${!!checkInTime ? 'YES' : 'NO'}`, id);
-
-          await env.DB.prepare(
-              `UPDATE bookings SET check_in_time=?, check_out_time=?, note=?, detail_status='DONE' WHERE booking_id=?`
-          )
-          .bind(
-              checkInTime,
-              checkOutTime,
-              note,
-              id 
-          )
-          .run();
-          
-          successfulRequests++;
-
-        } catch (err) {
-            if (err.message && err.message.includes("Too many subrequests")) {
-                
-                await env.DB.prepare(
-                    `UPDATE bookings SET detail_status='DONE' WHERE booking_id=?`
-                )
-                .bind(id)
-                .run();
-                
-                await logIssue(env, `Fetch error: Too many subrequests for ${id}. Stopping detailed fetch.`, id);
-                detailsStatus = "done"; 
-                return; 
-            }
-            await logIssue(env, `Fetch error for booking ID ${id}: ${err.message}`, id);
-            continue;
-        }
-    }
-    
-    detailsStatus = "done";
-    await logIssue(env, `✅ Detailed fetch complete. Successfully updated ${successfulRequests} bookings.`);
+  return {
+    booking_id: parseInt(item.id, 10) || item.id,
+    property_name: propName,
+    people,
+    guest_name: guest.name || "",
+    guest_phone: guestPhone,
+    lockbox_code: lockboxCode,
+    check_in_date: item.arrival ? item.arrival.slice(0, 10) : "",
+    check_in_time: checkInTime,
+    departure: item.departure ? item.departure.slice(0, 10) : "",
+    check_out_time: checkOutTime,
+    note: note,
+    detail_status: "DONE"
+  };
 }
 
-function delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// --------------------- batch upsert (Conditional Reset Logic) ---------------------
-async function batchUpsertBookings(env, rows, chunkSize, shouldReset) { 
-  if (!rows.length) return;
-  const columns = Object.keys(rows[0]);
-  
-  const protectedFields = [
-      'check_in_time', 
-      'check_out_time', 
-      'note' 
-  ];
-
-  const basicUpdateSet = columns
-    .filter(c => !protectedFields.includes(c) && c !== 'detail_status')
-    .map(c => `${c}=excluded.${c}`)
-    .join(",");
-  
-  const statusUpdate = shouldReset 
-    ? "detail_status = 'PENDING'" 
-    : "detail_status = CASE WHEN detail_status = 'DONE' THEN 'DONE' ELSE excluded.detail_status END";
-    
-  const fullUpdateSet = `${basicUpdateSet}, ${statusUpdate}`;
-
-  for (let i = 0; i < rows.length; i += chunkSize) {
-    const chunk = rows.slice(i, i + chunkSize);
-    const placeholders = chunk.map(_ => `(${columns.map(_ => "?").join(",")})`).join(",");
-    const values = chunk.flatMap(r => Object.values(r));
-    
-    const sql = `
-      INSERT INTO bookings (${columns.join(",")})
-      VALUES ${placeholders}
-      ON CONFLICT(booking_id) 
-      DO UPDATE SET ${fullUpdateSet}
-    `;
-    
-    await env.DB.prepare(sql).bind(...values).run();
-  }
-}
-
-// --------------------- map booking ---------------------
 function mapBooking(booking) {
   const guest = booking.guest || {};
   const breakdown = booking.total_guest_breakdown || {};
   const people = [
-    breakdown.adults ? `${breakdown.adults} adult${breakdown.adults>1?"s":""}` : "",
-    breakdown.children ? `${breakdown.children} child${breakdown.children>1?"ren":""}` : "",
-    breakdown.infants ? `${breakdown.infants} infant${breakdown.infants>1?"s":""}` : ""
+    breakdown.adults ? `${breakdown.adults} adult${breakdown.adults > 1 ? "s" : ""}` : "",
+    breakdown.children ? `${breakdown.children} child${breakdown.children > 1 ? "ren" : ""}` : "",
+    breakdown.infants ? `${breakdown.infants} infant${breakdown.infants > 1 ? "s" : ""}` : ""
   ].filter(Boolean).join(", ");
   const guestPhone = guest.phone || "";
-  const rawLockbox = String(guestPhone).replace(/[^0-9]/g, ''); 
+  const rawLockbox = String(guestPhone).replace(/[^0-9]/g, '');
   const lockbox = rawLockbox.slice(-4) || "";
   return {
-    booking_id: parseInt(booking.id, 10) || "", 
+    booking_id: parseInt(booking.id, 10) || "",
     property_name: booking.property_name || "",
     people,
     guest_name: guest.name || "",
     guest_phone: guestPhone,
     lockbox_code: lockbox,
-    check_in_date: booking.arrival || "",
+    check_in_date: booking.arrival ? booking.arrival.slice(0, 10) : "",
     check_in_time: booking.check_in?.time || "",
-    departure: booking.departure || "",
+    departure: booking.departure ? booking.departure.slice(0, 10) : "",
     check_out_time: booking.check_out?.time || "",
-    note: "", 
-    detail_status: "PENDING"
+    note: booking.note ? cleanNote(booking.note) : "",
+    detail_status: "DONE"
   };
+}
+
+async function batchUpsertBookingsV2(env, rows, chunkSize = 10) {
+  if (!rows.length) return;
+  const columns = Object.keys(rows[0]);
+
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    const chunk = rows.slice(i, i + chunkSize);
+    const placeholders = chunk.map(_ => `(${columns.map(_ => "?").join(",")})`).join(",");
+    const values = chunk.flatMap(r => Object.values(r));
+
+    const sql = `
+      INSERT INTO bookings (${columns.join(",")})
+      VALUES ${placeholders}
+      ON CONFLICT(booking_id) 
+      DO UPDATE SET
+        property_name = excluded.property_name,
+        people = excluded.people,
+        guest_name = excluded.guest_name,
+        guest_phone = excluded.guest_phone,
+        lockbox_code = CASE WHEN excluded.lockbox_code != '' THEN excluded.lockbox_code ELSE lockbox_code END,
+        check_in_date = excluded.check_in_date,
+        check_in_time = CASE WHEN excluded.check_in_time != '' THEN excluded.check_in_time ELSE check_in_time END,
+        departure = excluded.departure,
+        check_out_time = CASE WHEN excluded.check_out_time != '' THEN excluded.check_out_time ELSE check_out_time END,
+        note = CASE WHEN excluded.note != '' THEN excluded.note ELSE note END,
+        detail_status = 'DONE'
+    `;
+
+    await env.DB.prepare(sql).bind(...values).run();
+  }
 }
 
 function cleanNote(html) {
@@ -443,151 +454,136 @@ function cleanNote(html) {
     .trim();
 }
 
-// --------------------- serveIcalFeed (TOKEN CHECK ELTÁVOLÍTVA) ---------------------
-
-/**
- * Generates the iCal feed content for the specified properties, 
- * using the columns defined in the settings table.
- */
-async function serveIcalFeed(env, properties, settingName, host) {
-    // 1. TOKEN ELLENŐRZÉS ELTÁVOLÍTVA
-
-    // --- Adatok lekérése ---
-    let whereClause = "";
-    let bindParams = [];
-    if (properties.length) {
-        whereClause = `WHERE property_name IN (${properties.map((_, i) => `?${i + 1}`).join(",")})`;
-        bindParams = properties;
-    }
-    const sql = `SELECT * FROM bookings ${whereClause} ORDER BY check_in_date ASC`;
-    const rowsResult = await env.DB.prepare(sql).bind(...bindParams).all();
-    const bookings = rowsResult.results || [];
-
-    // --- Oszlop beállítások lekérése ---
-    let visibleColumns = [];
-    const settingsResult = await env.DB.prepare("SELECT value FROM settings WHERE name = ?").bind(settingName).first();
-    
-    const allColumns = [
-        "booking_id", "property_name", "people", "guest_name", "guest_phone",
-        "lockbox_code", "check_in_date", "check_in_time", "departure", "check_out_time", "note", "detail_status" 
-    ];
-
-    if (settingsResult && settingsResult.value) {
-        try {
-            const parsed = JSON.parse(settingsResult.value);
-            if (Array.isArray(parsed)) {
-                 visibleColumns = parsed.filter(col => allColumns.includes(col)); 
-            }
-        } catch (e) {
-            visibleColumns = allColumns; 
-        }
-    } else {
-         visibleColumns = allColumns;
-    }
-
-    const detailColumns = allColumns.filter(col => visibleColumns.includes(col));
-
-    // --- iCal tartalom generálása ---
-    let ical = `BEGIN:VCALENDAR\r\n`;
-    ical += `PRODID:-//Cloudflare Worker//Booking Scheduler v1.0//EN\r\n`;
-    ical += `VERSION:2.0\r\n`;
-    ical += `CALSCALE:GREGORIAN\r\n`;
-    ical += `METHOD:PUBLISH\r\n`;
-    ical += `X-WR-CALNAME:${settingName.replace("-Columns", "").replace("-", " ")} Bookings\r\n`;
-    ical += `X-PUBLISHED-TTL:PT5M\r\n`; 
-
-    for (const booking of bookings) {
-        const dtstart = booking.check_in_date ? booking.check_in_date.replace(/-/g, '') : '';
-        const dtend = booking.departure ? booking.departure.replace(/-/g, '') : ''; 
-
-        if (!dtstart || !dtend) continue; 
-
-        // 1. SUMMARY (Összefoglaló)
-        let summaryParts = [];
-        if (visibleColumns.includes('property_name')) summaryParts.push(booking.property_name); 
-        if (visibleColumns.includes('guest_name') && booking.guest_name) summaryParts.push(booking.guest_name);
-        else if (visibleColumns.includes('people') && booking.people) summaryParts.push(booking.people);
-        
-        let summary = summaryParts.filter(Boolean).join(' - ') || 'Foglalt';
-        
-        // 2. DESCRIPTION (Leírás)
-        const descriptionLines = [];
-        const labelMap = {
-            "booking_id": "Booking ID",
-            "property_name": "Property",
-            "people": "People",
-            "guest_name": "Guest Name",
-            "guest_phone": "Phone",
-            "lockbox_code": "Lockbox",
-            "check_in_date": "Check-in Date",
-            "check_in_time": "Check-in Time",
-            "departure": "Departure Date",
-            "check_out_time": "Check-out Time",
-            "note": "Note",
-            "detail_status": "Status"
-        };
-        
-        for (const col of detailColumns) {
-            const label = labelMap[col] || col.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-            let value = booking[col] || "Nincs adat";
-            
-            if (col !== 'property_name' && col !== 'guest_name' && col !== 'people') {
-                 
-                 if (col === 'check_in_date' || col === 'departure') {
-                    value = value.slice(0, 10); 
-                 }
-                 if (col === 'note') {
-                    value = value.replace(/(\r\n|\n|\r)/gm, '\\n');
-                 }
-                 
-                 descriptionLines.push(`${label}: ${value}`);
-            }
-        }
-        
-        const description = descriptionLines.join('\\n');
-        
-        // 3. VEVENT esemény generálása
-        ical += `BEGIN:VEVENT\r\n`;
-        ical += `DTSTART;VALUE=DATE:${dtstart}\r\n`; 
-        ical += `DTEND;VALUE=DATE:${dtend}\r\n`; 
-        ical += `DTSTAMP:${new Date().toISOString().replace(/[-:]/g, '').split('.')[0]}Z\r\n`;
-        ical += `UID:${booking.booking_id}@${host}\r\n`; 
-        ical += `SUMMARY:${summary}\r\n`;
-        // Removed `download` flag, but kept file content type
-        ical += `DESCRIPTION:${description.replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,')}\r\n`;
-        ical += `END:VEVENT\r\n`;
-    }
-
-    ical += `END:VCALENDAR\r\n`;
-
-    return new Response(ical, {
-        headers: {
-            // Content-Disposition: `attachment; filename="${settingName.replace("-Columns", "").toLowerCase()}.ics"` ELTÁVOLÍTVA
-            "Content-Type": "text/calendar; charset=utf-8", 
-            "Cache-Control": "public, max-age=300" 
-        },
-    });
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-
-// --------------------- serve table (ICAL SECURITY SECTION ELTÁVOLÍTVA) ---------------------
-async function serveTable(env, properties, title, authUser = null) {
+// --------------------- serveIcalFeed ---------------------
+async function serveIcalFeed(env, properties, settingName, host) {
   let whereClause = "";
   let bindParams = [];
   if (properties.length) {
-    whereClause = `WHERE property_name IN (${properties.map((_,i)=>`?${i+1}`).join(",")})`;
+    whereClause = `WHERE property_name IN (${properties.map((_, i) => `?${i + 1}`).join(",")})`;
+    bindParams = properties;
+  }
+  const sql = `SELECT * FROM bookings ${whereClause} ORDER BY check_in_date ASC`;
+  const rowsResult = await env.DB.prepare(sql).bind(...bindParams).all();
+  const bookings = rowsResult.results || [];
+
+  let visibleColumns = [];
+  const settingsResult = await env.DB.prepare("SELECT value FROM settings WHERE name = ?").bind(settingName).first();
+
+  const allColumns = [
+    "booking_id", "property_name", "people", "guest_name", "guest_phone",
+    "lockbox_code", "check_in_date", "check_in_time", "departure", "check_out_time", "note", "detail_status"
+  ];
+
+  if (settingsResult && settingsResult.value) {
+    try {
+      const parsed = JSON.parse(settingsResult.value);
+      if (Array.isArray(parsed)) {
+        visibleColumns = parsed.filter(col => allColumns.includes(col));
+      }
+    } catch (e) {
+      visibleColumns = allColumns;
+    }
+  } else {
+    visibleColumns = allColumns;
+  }
+
+  const detailColumns = allColumns.filter(col => visibleColumns.includes(col));
+
+  let ical = `BEGIN:VCALENDAR\r\n`;
+  ical += `PRODID:-//Cloudflare Worker//Booking Scheduler v2.0//EN\r\n`;
+  ical += `VERSION:2.0\r\n`;
+  ical += `CALSCALE:GREGORIAN\r\n`;
+  ical += `METHOD:PUBLISH\r\n`;
+  ical += `X-WR-CALNAME:${settingName.replace("-Columns", "").replace("-", " ")} Bookings\r\n`;
+  ical += `X-PUBLISHED-TTL:PT5M\r\n`;
+
+  for (const booking of bookings) {
+    const dtstart = booking.check_in_date ? booking.check_in_date.replace(/-/g, '') : '';
+    const dtend = booking.departure ? booking.departure.replace(/-/g, '') : '';
+    if (!dtstart || !dtend) continue;
+
+    let summaryParts = [];
+    if (visibleColumns.includes('property_name')) summaryParts.push(booking.property_name);
+    if (visibleColumns.includes('guest_name') && booking.guest_name) summaryParts.push(booking.guest_name);
+    else if (visibleColumns.includes('people') && booking.people) summaryParts.push(booking.people);
+
+    let summary = summaryParts.filter(Boolean).join(' - ') || 'Foglalt';
+
+    const descriptionLines = [];
+    const labelMap = {
+      "booking_id": "Booking ID",
+      "property_name": "Property",
+      "people": "People",
+      "guest_name": "Guest Name",
+      "guest_phone": "Phone",
+      "lockbox_code": "Lockbox",
+      "check_in_date": "Check-in Date",
+      "check_in_time": "Check-in Time",
+      "departure": "Departure Date",
+      "check_out_time": "Check-out Time",
+      "note": "Note",
+      "detail_status": "Status"
+    };
+
+    for (const col of detailColumns) {
+      const label = labelMap[col] || col.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+      let value = booking[col] || "Nincs adat";
+
+      if (col !== 'property_name' && col !== 'guest_name' && col !== 'people') {
+        if (col === 'check_in_date' || col === 'departure') {
+          value = value.slice(0, 10);
+        }
+        if (col === 'note') {
+          value = value.replace(/(\r\n|\n|\r)/gm, '\\n');
+        }
+        descriptionLines.push(`${label}: ${value}`);
+      }
+    }
+
+    const description = descriptionLines.join('\\n');
+
+    ical += `BEGIN:VEVENT\r\n`;
+    ical += `DTSTART;VALUE=DATE:${dtstart}\r\n`;
+    ical += `DTEND;VALUE=DATE:${dtend}\r\n`;
+    ical += `DTSTAMP:${new Date().toISOString().replace(/[-:]/g, '').split('.')[0]}Z\r\n`;
+    ical += `UID:${booking.booking_id}@${host}\r\n`;
+    ical += `SUMMARY:${summary}\r\n`;
+    ical += `DESCRIPTION:${description.replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,')}\r\n`;
+    ical += `END:VEVENT\r\n`;
+  }
+
+  ical += `END:VCALENDAR\r\n`;
+
+  return new Response(ical, {
+    headers: {
+      "Content-Type": "text/calendar; charset=utf-8",
+      "Cache-Control": "public, max-age=300"
+    },
+  });
+}
+
+// --------------------- serveTable ---------------------
+async function serveTable(env, properties, title, authUser = null, host = "ferkomes.com") {
+  let whereClause = "";
+  let bindParams = [];
+  if (properties.length) {
+    whereClause = `WHERE property_name IN (${properties.map((_, i) => `?${i + 1}`).join(",")})`;
     bindParams = properties;
   }
   const sql = `SELECT * FROM bookings ${whereClause} ORDER BY check_in_date ASC`;
   const rows = await env.DB.prepare(sql).bind(...bindParams).all();
-  
+
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const now = new Date();
-  
-  const upcomingBookings = rows.results.filter(r => new Date(r.check_in_date) >= today);
+
+  const upcomingBookings = (rows.results || []).filter(r => new Date(r.check_in_date) >= today);
   const earliestArrivalDate = upcomingBookings.length > 0 ? new Date(upcomingBookings[0].check_in_date) : null;
-  
+
   let nextArrivalIds = new Set();
   if (earliestArrivalDate) {
     nextArrivalIds = new Set(
@@ -599,166 +595,314 @@ async function serveTable(env, properties, title, authUser = null) {
 
   const columns = [
     "booking_id", "property_name", "people", "guest_name", "guest_phone",
-    "lockbox_code", "check_in_date", "check_in_time", "departure", "check_out_time", "note", "detail_status" 
+    "lockbox_code", "check_in_date", "check_in_time", "departure", "check_out_time", "note", "detail_status"
   ];
-  let statusMsg = "";
-  if (detailsStatus === "processing") statusMsg = "🟠 Details are being processed for missing entries…";
-  else if (detailsStatus === "done") statusMsg = "✅ Details update complete";
-  else if (detailsStatus === "failed") statusMsg = "⚠️ Details update failed";
 
-
-  // --- Column Selection Logic ---
+  // Column Visibility Settings
   const laArenaSettingsResult = await env.DB.prepare("SELECT value FROM settings WHERE name = 'La-Arena-Columns'").first();
   const golfDelSurSettingsResult = await env.DB.prepare("SELECT value FROM settings WHERE name = 'Golf-del-Sur-Columns'").first();
-  
+
   let laArenaCols = columns;
   let golfDelSurCols = columns;
 
   if (laArenaSettingsResult && laArenaSettingsResult.value) {
-      try {
-          const parsed = JSON.parse(laArenaSettingsResult.value);
-          if (Array.isArray(parsed)) laArenaCols = parsed;
-      } catch (e) {
-          console.error("Failed to parse La-Arena columns:", e);
-      }
+    try {
+      const parsed = JSON.parse(laArenaSettingsResult.value);
+      if (Array.isArray(parsed)) laArenaCols = parsed;
+    } catch (e) {}
   }
 
   if (golfDelSurSettingsResult && golfDelSurSettingsResult.value) {
-      try {
-          const parsed = JSON.parse(golfDelSurSettingsResult.value);
-          if (Array.isArray(parsed)) golfDelSurCols = parsed;
-      } catch (e) {
-          console.error("Failed to parse Golf-del-Sur columns:", e);
-      }
+    try {
+      const parsed = JSON.parse(golfDelSurSettingsResult.value);
+      if (Array.isArray(parsed)) golfDelSurCols = parsed;
+    } catch (e) {}
   }
 
-  let currentVisibleCols = columns; 
+  let currentVisibleCols = columns;
   if (title.includes("La-Arena") && laArenaCols.length) {
     currentVisibleCols = laArenaCols;
   } else if (title.includes("Golf-del-Sur") && golfDelSurCols.length) {
     currentVisibleCols = golfDelSurCols;
   }
-  // --- END Column Selection Logic ---
 
   const isAllBookings = title === "All Bookings";
   const isAdmin = authUser && authUser.role === "admin";
 
-  let html = `<html><head>
+  // Last Sync status check
+  const cooldownCheck = await checkSyncCooldown(env);
+  let lastSyncText = "";
+  if (cooldownCheck.lastSyncIso) {
+    const d = new Date(cooldownCheck.lastSyncIso);
+    lastSyncText = `Utolsó szinkronizáció: ${d.toLocaleTimeString("hu-HU", { hour: '2-digit', minute: '2-digit' })}`;
+  }
+
+  let html = `<!DOCTYPE html>
+<html lang="hu">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${title} - Takarítási Naptár</title>
 <style>
-body{font-family:Arial;margin:10px;}
-button{padding:8px 14px;margin-bottom:8px;font-size:13px;cursor:pointer;border-radius:4px;border:1px solid #ccc;background:#f5f5f5;}
-button:hover{background:#e8e8e8;}
-.nav-active{background:#0070f3 !important; color:white !important; border-color:#0070f3 !important;}
-table{border-collapse:collapse;width:100%;font-size:14px;}
-th,td{border:1px solid #ccc;padding:6px;text-align:left;}
-th{background:#f2f2f2;}
-tr:nth-child(even){background:#fafafa;}
-.green{background:lightgreen !important;}
-.grey{background:lightgrey !important;}
-.blue{background:lightblue !important;}
-.container{overflow-x:auto;}
-#syncMsg{position:fixed;top:5px;right:5px;background:#0a0;color:#fff;padding:6px 12px;border-radius:4px;opacity:0;transition:opacity 0.5s;}
-#detailsProcessing{margin-bottom:10px;font-weight:bold;}
-@media(max-width:600px){table,th,td{font-size:12px;padding:4px;}}
+  :root {
+    --primary: #2563eb;
+    --primary-hover: #1d4ed8;
+    --success: #059669;
+    --success-hover: #047857;
+    --bg-light: #f9fafb;
+    --border-color: #e5e7eb;
+    --text-main: #1f2937;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    margin: 0;
+    padding: 16px;
+    background: #fdfdfd;
+    color: var(--text-main);
+  }
+  .header-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 2px solid var(--border-color);
+  }
+  .header-title {
+    font-size: 22px;
+    font-weight: 700;
+    margin: 0;
+    color: #111827;
+  }
+  .user-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 14px;
+    background: #f3f4f6;
+    border: 1px solid #d1d5db;
+    border-radius: 9999px;
+    font-size: 13px;
+    color: #374151;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    user-select: none;
+  }
+  .user-badge:hover {
+    background: #fee2e2;
+    border-color: #fca5a5;
+    color: #991b1b;
+  }
+  .logout-btn {
+    font-size: 11px;
+    background: #e5e7eb;
+    padding: 2px 8px;
+    border-radius: 9999px;
+    font-weight: 600;
+    transition: all 0.15s;
+  }
+  .user-badge:hover .logout-btn {
+    background: #ef4444;
+    color: white;
+  }
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+  }
+  .nav-btn {
+    padding: 8px 14px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    border-radius: 6px;
+    border: 1px solid #d1d5db;
+    background: #ffffff;
+    color: #374151;
+    transition: all 0.15s ease;
+  }
+  .nav-btn:hover {
+    background: #f3f4f6;
+    border-color: #9ca3af;
+  }
+  .nav-active {
+    background: var(--primary) !important;
+    color: #ffffff !important;
+    border-color: var(--primary) !important;
+    box-shadow: 0 1px 2px rgba(37, 99, 235, 0.2);
+  }
+  .sync-btn {
+    background: var(--success) !important;
+    color: white !important;
+    border-color: var(--success) !important;
+    font-weight: 600;
+  }
+  .sync-btn:hover {
+    background: var(--success-hover) !important;
+  }
+  .sync-btn:disabled {
+    background: #9ca3af !important;
+    border-color: #9ca3af !important;
+    cursor: not-allowed;
+  }
+  .sync-meta {
+    font-size: 12px;
+    color: #6b7280;
+    margin-left: auto;
+  }
+  .container {
+    overflow-x: auto;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 13px;
+  }
+  th, td {
+    border: 1px solid #e5e7eb;
+    padding: 8px 10px;
+    text-align: left;
+    white-space: nowrap;
+  }
+  th {
+    background: #f9fafb;
+    color: #374151;
+    font-weight: 600;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  tr:nth-child(even) { background: #fafafa; }
+  tr:hover { background: #f0fdf4; }
+  .green { background: #dcfce7 !important; font-weight: 600; }
+  .blue { background: #e0f2fe !important; }
+  .grey { background: #f3f4f6 !important; color: #9ca3af; }
+  #syncMsg {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    z-index: 9999;
+    background: #10b981;
+    color: #ffffff;
+    padding: 10px 18px;
+    border-radius: 8px;
+    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -1px rgba(0,0,0,0.06);
+    font-size: 13px;
+    font-weight: 600;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s ease;
+  }
+  @media(max-width: 640px) {
+    body { padding: 10px; }
+    th, td { font-size: 12px; padding: 6px; }
+    .header-title { font-size: 18px; }
+    .nav-btn { padding: 6px 10px; font-size: 12px; }
+  }
 </style>
-</head><body>
-<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; margin-bottom:12px; border-bottom:1px solid #ddd; padding-bottom:8px;">
-  <h2 style="margin:0;">${title}</h2>
-  ${authUser ? `<div style="font-size:13px; color:#555;">👤 Bejelentkezve: <strong>${authUser.username}</strong></div>` : ``}
+</head>
+<body>
+
+<div id="syncMsg"></div>
+
+<div class="header-bar">
+  <div style="display:flex; align-items:center; gap: 12px;">
+    <h1 class="header-title">${title}</h1>
+  </div>
+  ${authUser ? `
+  <div class="user-badge" onclick="logout()" title="Kattints ide a kijelentkezéshez">
+    <span>👤 <strong>${authUser.username}</strong></span>
+    <span class="logout-btn">🚪 Kilépés</span>
+  </div>
+  ` : ''}
+</div>
+
+<div class="toolbar">
+  ${isAdmin ? `
+    <button type="button" onclick="location.href='?view=all'" class="nav-btn ${title === 'All Bookings' ? 'nav-active' : ''}">Összes apartman</button>
+    <button type="button" onclick="location.href='?view=la-arena'" class="nav-btn ${title.includes('La-Arena') ? 'nav-active' : ''}">La-Arena (Kata)</button>
+    <button type="button" onclick="location.href='?view=golf-del-sur'" class="nav-btn ${title.includes('Golf-del-Sur') ? 'nav-active' : ''}">Golf-del-Sur (Gábor)</button>
+    <button type="button" onclick="location.href='?view=logs'" class="nav-btn">Rendszernaplók (Logs)</button>
+  ` : ''}
+  <button type="button" id="updateBtn" onclick="updateTable()" class="nav-btn sync-btn">🔄 Frissítés (Sync)</button>
+  ${lastSyncText ? `<span class="sync-meta">${lastSyncText}</span>` : ''}
 </div>
 `;
 
-  if (isAdmin) {
-    html += `
-    <div style="margin-bottom: 12px; display: flex; gap: 8px; flex-wrap: wrap;">
-      <a href="?view=all"><button class="${title === 'All Bookings' ? 'nav-active' : ''}">Összes apartman</button></a>
-      <a href="?view=la-arena"><button class="${title.includes('La-Arena') ? 'nav-active' : ''}">La-Arena (Kata)</button></a>
-      <a href="?view=golf-del-sur"><button class="${title.includes('Golf-del-Sur') ? 'nav-active' : ''}">Golf-del-Sur (Gábor)</button></a>
-      <a href="/logs"><button>View Logs</button></a>
-      <button id="updateBtn" onclick="updateTable()" style="background:#28a745; color:white; border-color:#28a745;">Frissítés (Sync)</button>
-    </div>`;
-  }
-
-  html += `<div id="syncMsg"></div>
-${statusMsg?`<div id="detailsProcessing">${statusMsg}</div>`:``}
-`; 
-
-  // --- COLUMN SELECTION FORM VISSZAÁLLÍTVA AZ ADMIN FELÜLETRE ---
+  // --- Admin iCal Feed és Oszlop Láthatóság Panel ---
   if (isAdmin && title === "All Bookings") {
-    // Visszaállítva a korábbi, egyszerű ICAL linkek bemutatására
-    const host = "worker.default.tld"; // Csak placeholder, a böngésző fogja behelyettesíteni
-
     html += `
-<hr>
-<div style="background:#f0f8ff; padding:10px; border-radius:4px; margin-bottom:15px; border:1px solid #b0e0e6;">
-    <h4>iCal Feed Linkek (Biztonsági Token Nélkül)</h4>
-    <p>Ezek a linkek most a Worker egyszerű elérési útját használják. Naptár programokba való beillesztéskor a böngésző megnyitásával ellenőrizhető a tartalom.</p>
-    
-    <p>**La-Arena iCal Link:**</p>
-    <code style="font-family:monospace; background:#fff; padding:5px; border:1px solid #ddd; word-break:break-all; display:block; margin-bottom:8px;">https://${host}/la-arena-ical</code>
-
-    <p>**Golf-del-Sur iCal Link:**</p>
-    <code style="font-family:monospace; background:#fff; padding:5px; border:1px solid #ddd; word-break:break-all; display:block; margin-bottom:8px;">https://${host}/golf-del-sur-ical</code>
-    <p style="font-size:12px; margin-top: 5px;">*A linket másolja ki, és illessze be a takarító csapat naptárrendszerébe (pl. Google Calendar, Outlook).*</p>
+<div style="background:#f0f9ff; padding:14px; border-radius:8px; margin-bottom:16px; border:1px solid #bae6fd;">
+  <h3 style="margin-top:0; font-size:15px; color:#0369a1;">📅 iCal Naptár Feed Linkek (Automatikus szinkronizációhoz)</h3>
+  <p style="font-size:13px; color:#0c4a6e; margin-bottom:8px;">Másold ki az alábbi linkeket a Google Naptárba, Outlookba vagy Apple Calendarba történő beillesztéshez:</p>
+  <div style="margin-bottom:8px;">
+    <strong style="font-size:13px;">La-Arena iCal:</strong>
+    <code id="laArenaIcal" style="display:block; background:#fff; padding:6px 10px; border:1px solid #cbd5e1; border-radius:4px; font-size:12px; margin-top:4px; word-break:break-all;">https://${host}/la-arena-ical</code>
+  </div>
+  <div>
+    <strong style="font-size:13px;">Golf-del-Sur iCal:</strong>
+    <code id="golfIcal" style="display:block; background:#fff; padding:6px 10px; border:1px solid #cbd5e1; border-radius:4px; font-size:12px; margin-top:4px; word-break:break-all;">https://${host}/golf-del-sur-ical</code>
+  </div>
 </div>
-<hr>
+
+<details style="margin-bottom:16px; background:#fafafa; border:1px solid #e5e7eb; border-radius:8px; padding:12px;">
+  <summary style="font-weight:600; cursor:pointer; font-size:14px; color:#374151;">⚙️ Oszlop Láthatóság Beállítása (Kata és Gábor nézeteihez)</summary>
+  <div style="display:flex; gap:20px; flex-wrap:wrap; margin-top:12px;">
+    <div style="flex:1; min-width:260px; padding:12px; background:#fff; border:1px solid #e5e7eb; border-radius:6px;">
+      <h4 style="margin-top:0; font-size:14px;">La-Arena Oszlopok</h4>
+      <form id="laArenaForm">
+        <input type="hidden" name="name" value="La-Arena-Columns">
+        ${columns.map(c => `
+          <div style="margin-bottom:4px; font-size:13px;">
+            <label style="cursor:pointer;">
+              <input type="checkbox" name="column" value="${c}" ${laArenaCols.includes(c) ? 'checked' : ''}>
+              ${c}
+            </label>
+          </div>
+        `).join('')}
+        <button type="button" onclick="saveSettings('laArenaForm')" class="nav-btn" style="margin-top:8px; background:#2563eb; color:white; border-color:#2563eb;">Mentés (La-Arena)</button>
+      </form>
+    </div>
+
+    <div style="flex:1; min-width:260px; padding:12px; background:#fff; border:1px solid #e5e7eb; border-radius:6px;">
+      <h4 style="margin-top:0; font-size:14px;">Golf-del-Sur Oszlopok</h4>
+      <form id="golfForm">
+        <input type="hidden" name="name" value="Golf-del-Sur-Columns">
+        ${columns.map(c => `
+          <div style="margin-bottom:4px; font-size:13px;">
+            <label style="cursor:pointer;">
+              <input type="checkbox" name="column" value="${c}" ${golfDelSurCols.includes(c) ? 'checked' : ''}>
+              ${c}
+            </label>
+          </div>
+        `).join('')}
+        <button type="button" onclick="saveSettings('golfForm')" class="nav-btn" style="margin-top:8px; background:#2563eb; color:white; border-color:#2563eb;">Mentés (Golf-del-Sur)</button>
+      </form>
+    </div>
+  </div>
+</details>
 `;
-    // --- Column Selection Form ---
-    html += `
-<h3>Column Visibility Settings</h3>
-<p>Select fields to display on the **La-Arena** and **Golf-del-Sur** pages (ezek mennek az iCal feedbe is).</p>
-    
-<div style="display:flex; gap: 20px; flex-wrap: wrap;">
-  <div style="padding: 10px; border: 1px solid #ccc; border-radius: 5px;">
-    <h4>La-Arena Columns</h4>
-    <form id="laArenaForm">
-      <input type="hidden" name="name" value="La-Arena-Columns">
-      ${columns.map(c => `
-        <div>
-          <input type="checkbox" name="column" value="${c}" id="la-${c}" 
-            ${laArenaCols.includes(c) ? 'checked' : ''}>
-          <label for="la-${c}">${c}</label>
-        </div>
-      `).join('')}
-      <button type="button" onclick="saveSettings('laArenaForm')">Save La-Arena</button>
-    </form>
-  </div>
-  
-  <div style="padding: 10px; border: 1px solid #ccc; border-radius: 5px;">
-    <h4>Golf-del-Sur Columns</h4>
-    <form id="golfForm">
-      <input type="hidden" name="name" value="Golf-del-Sur-Columns">
-      ${columns.map(c => `
-        <div>
-          <input type="checkbox" name="column" value="${c}" id="golf-${c}" 
-            ${golfDelSurCols.includes(c) ? 'checked' : ''}>
-          <label for="golf-${c}">${c}</label>
-        </div>
-      `).join('')}
-      <button type="button" onclick="saveSettings('golfForm')">Save Golf-del-Sur</button>
-    </form>
-  </div>
-</div>
-<hr>`;
   }
-  // --- END NEW FORM AND SECURITY SECTION ---
 
-  // --- Start Table with Dynamic Header/Content ---
+  // --- Táblázat Fejléc és Tartalom ---
   const headerHtml = columns.map(c => {
     const isHidden = !isAllBookings && !currentVisibleCols.includes(c);
     const style = isHidden ? 'style="display:none;"' : '';
-    
-    const checkbox = isAllBookings ? `<input type="checkbox" ${currentVisibleCols.includes(c) ? 'checked' : ''} onchange="toggleColumn(event,'${c}')">` : '';
-    
+    const checkbox = isAllBookings ? `<input type="checkbox" ${currentVisibleCols.includes(c) ? 'checked' : ''} onchange="toggleColumn(event,'${c}')" style="margin-right:6px;">` : '';
     return `<th ${style}>${checkbox}${c}</th>`;
   }).join("");
 
+  html += `<div class="container"><table id="bookingTable"><thead><tr>${headerHtml}</tr></thead><tbody>`;
 
-  html += `<div class="container"><table id="bookingTable"><tr>${headerHtml}</tr>`;
-
-  for (const row of rows.results) {
+  for (const row of (rows.results || [])) {
     const arrival = new Date(row.check_in_date);
     const departure = new Date(row.departure);
     arrival.setHours(0, 0, 0, 0);
@@ -776,58 +920,90 @@ ${statusMsg?`<div id="detailsProcessing">${statusMsg}</div>`:``}
     html += `<tr class="${cls}">` + columns.map(c => {
       const isHidden = !isAllBookings && !currentVisibleCols.includes(c);
       const style = isHidden ? 'style="display:none;"' : '';
-      return `<td ${style}>${row[c]||""}</td>`;
+      return `<td ${style}>${row[c] || ""}</td>`;
     }).join("") + `</tr>`;
   }
 
-  html += `</table></div>
-<script>
-// A Host nevet frissítő és a Token regeneráló funkciók ELTÁVOLÍTVA
-// Visszaállítva az egyszerűbb onload-ra
-window.onload=function(){
-  const greenRow=document.querySelector("tr.green");
-  if(greenRow) greenRow.scrollIntoView({behavior:"smooth"});
+  html += `</tbody></table></div>
 
-  // Host nevek frissítése a kód blokkokban (bár a linkek már egyszerűek)
-  const host = window.location.host;
-  document.querySelectorAll('code').forEach(codeBlock => {
-    codeBlock.textContent = codeBlock.textContent.replace('worker.default.tld', host);
-  });
+<script>
+window.onload = function() {
+  const greenRow = document.querySelector("tr.green");
+  if (greenRow) greenRow.scrollIntoView({ behavior: "smooth", block: "center" });
+
+  // Update iCal URLs with current origin
+  const origin = window.location.origin;
+  const laEl = document.getElementById("laArenaIcal");
+  const golfEl = document.getElementById("golfIcal");
+  if (laEl) laEl.textContent = origin + "/la-arena-ical";
+  if (golfEl) golfEl.textContent = origin + "/golf-del-sur-ical";
 };
 
-async function updateTable(){
-  const btn=document.querySelector("#updateBtn");
-  btn.disabled=true; btn.textContent="Syncing...";
-  try{
-    const resp=await fetch("/update");
-    const txt=await resp.text();
-    const msg=document.getElementById("syncMsg");
-    msg.textContent=txt;
-    msg.style.opacity=1;
-    setTimeout(()=>msg.style.opacity=0,3000);
-    setTimeout(()=>location.reload(), 1500);
-  }catch(e){
-    alert("Update failed: "+e);
-    btn.disabled=false; btn.textContent="Update All Bookings";
+// Kijelentkezés
+async function logout() {
+  if (!confirm("Biztosan ki szeretnél jelentkezni?")) return;
+  try {
+    await fetch(window.location.pathname + "?action=logout", {
+      headers: { "Authorization": "Basic " + btoa("logout:logout") }
+    });
+  } catch (e) {}
+  window.location.href = window.location.pathname + "?action=logout";
+}
+
+// Szinkronizálás (Sync)
+async function updateTable() {
+  const btn = document.querySelector("#updateBtn");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Szinkronizálás folyamatban...";
+  }
+
+  const msg = document.getElementById("syncMsg");
+  try {
+    const resp = await fetch(window.location.pathname + "?action=update");
+    const txt = await resp.text();
+
+    if (msg) {
+      msg.textContent = txt;
+      msg.style.opacity = 1;
+      msg.style.background = resp.ok && !txt.includes("⏳") ? "#10b981" : "#f59e0b";
+      setTimeout(() => { msg.style.opacity = 0; }, 4500);
+    }
+
+    if (resp.ok && !txt.includes("⏳")) {
+      setTimeout(() => location.reload(), 1500);
+    } else {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "🔄 Frissítés (Sync)";
+      }
+    }
+  } catch (e) {
+    alert("Frissítési hiba: " + e);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "🔄 Frissítés (Sync)";
+    }
   }
 }
 
-function toggleColumn(event,col){
-  const checked=event.target.checked;
+// Oszlop ki/be kapcsolás
+function toggleColumn(event, col) {
+  const checked = event.target.checked;
   const headers = [...document.querySelectorAll("#bookingTable th")];
-  const idx = headers.findIndex(th => th.textContent.includes(col)); 
-  if(idx < 0) return;
-  document.querySelectorAll("#bookingTable tr").forEach(tr=>{
-    if(tr.cells[idx]) tr.cells[idx].style.display=checked?"":"none";
+  const idx = headers.findIndex(th => th.textContent.includes(col));
+  if (idx < 0) return;
+  document.querySelectorAll("#bookingTable tr").forEach(tr => {
+    if (tr.cells[idx]) tr.cells[idx].style.display = checked ? "" : "none";
   });
 }
 
-// Save settings function
+// Beállítások mentése
 async function saveSettings(formId) {
   const form = document.getElementById(formId);
   const name = form.elements['name'].value;
   const selectedColumns = [];
-  
+
   form.elements['column'].forEach(checkbox => {
     if (checkbox.checked) {
       selectedColumns.push(checkbox.value);
@@ -835,32 +1011,33 @@ async function saveSettings(formId) {
   });
 
   try {
-    const resp = await fetch('/save-settings', {
+    const resp = await fetch(window.location.pathname + '?action=save-settings', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: name, columns: selectedColumns })
     });
-    
+
     const msg = document.getElementById("syncMsg");
-    msg.textContent = resp.ok ? '✅ ' + name + ' settings saved! Reload to see changes.' : '⚠️ Failed to save ' + name + '.';
-    msg.style.opacity = 1;
-    setTimeout(() => msg.style.opacity = 0, 3000);
-    
-    if(resp.ok) {
-        setTimeout(() => location.reload(), 500);
+    if (msg) {
+      msg.textContent = resp.ok ? '✅ ' + name + ' sikeresen mentve!' : '⚠️ Nem sikerült a mentés.';
+      msg.style.opacity = 1;
+      msg.style.background = resp.ok ? "#10b981" : "#ef4444";
+      setTimeout(() => { msg.style.opacity = 0; }, 3000);
     }
 
-
+    if (resp.ok) {
+      setTimeout(() => location.reload(), 800);
+    }
   } catch (e) {
-    alert("Failed to save settings: " + e);
+    alert("Hiba a mentés során: " + e);
   }
 }
 </script>
-</body></html>`;
+</body>
+</html>`;
+
   return new Response(html, {
-    headers: {
-      "Content-Type": "text/html"
-    }
+    headers: { "Content-Type": "text/html; charset=utf-8" }
   });
 }
 
@@ -869,17 +1046,17 @@ async function handleSettingsPost(request, env) {
   try {
     const data = await request.json();
     const { name, columns } = data;
-    
+
     if (!name || !columns || !Array.isArray(columns)) {
       return new Response("Invalid input", { status: 400 });
     }
-    
+
     const value = JSON.stringify(columns);
-    
+
     await env.DB.prepare(
       `INSERT INTO settings (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value=excluded.value`
     ).bind(name, value).run();
-    
+
     return new Response("Settings saved", { status: 200 });
   } catch (err) {
     await logIssue(env, `Failed to save settings: ${err.message}`);
@@ -887,7 +1064,7 @@ async function handleSettingsPost(request, env) {
   }
 }
 
-// --------------------- New functions for logging ---------------------
+// --------------------- Logging & Logs View ---------------------
 async function logIssue(env, message, bookingId = null) {
   try {
     await env.DB.prepare(
@@ -898,39 +1075,87 @@ async function logIssue(env, message, bookingId = null) {
   }
 }
 
-async function serveLogs(env) {
-  const result = await env.DB.prepare("SELECT * FROM logs ORDER BY timestamp DESC LIMIT 200").all(); 
-
+async function serveLogs(env, authUser = null) {
+  const result = await env.DB.prepare("SELECT * FROM logs ORDER BY timestamp DESC LIMIT 200").all();
   const columns = ["timestamp", "booking_id", "message"];
 
-  let html = `<html><head>
+  let html = `<!DOCTYPE html>
+<html lang="hu">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rendszernaplók - Cleaning Calendar</title>
 <style>
-body{font-family:Arial;margin:10px;}
-table{border-collapse:collapse;width:100%;font-size:14px;}
-th,td{border:1px solid #ccc;padding:6px;text-align:left;}
-th{background:#f2f2f2;}
-tr:nth-child(even){background:#fafafa;}
-.container{overflow-x:auto;}
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    margin: 16px;
+    background: #fdfdfd;
+    color: #1f2937;
+  }
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 2px solid #e5e7eb;
+  }
+  h2 { margin: 0; }
+  .btn {
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+    border-radius: 6px;
+    border: 1px solid #d1d5db;
+    background: #ffffff;
+    color: #374151;
+    text-decoration: none;
+  }
+  .btn:hover { background: #f3f4f6; }
+  .container {
+    overflow-x: auto;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border: 1px solid #e5e7eb; padding: 8px 10px; text-align: left; }
+  th { background: #f9fafb; font-weight: 600; }
+  tr:nth-child(even) { background: #fafafa; }
+  .err { background-color: #fee2e2; color: #991b1b; font-weight: 600; }
+  .succ { background-color: #ecfdf5; color: #065f46; font-weight: 600; }
 </style>
-</head><body>
-<h2>System Logs</h2>
-<a href="/all-bookings"><button>Back to Bookings</button></a>
-<div class="container"><table id="logTable"><tr>${columns.map(c=>`<th>${c}</th>`).join("")}</tr>`;
+</head>
+<body>
+<div class="header">
+  <h2>📋 Rendszernaplók (System Logs)</h2>
+  <button type="button" onclick="location.href='?view=all'" class="btn">⬅️ Vissza a naptárhoz</button>
+</div>
+<div class="container">
+<table>
+  <thead>
+    <tr>${columns.map(c => `<th>${c}</th>`).join("")}</tr>
+  </thead>
+  <tbody>`;
 
   if (result.results) {
     for (const row of result.results) {
-      const messageClass = row.message && row.message.includes("Too many subrequests") ? 'style="background-color: #fdd; font-weight: bold;"' : '';
-      html += `<tr>` + columns.map(c => `<td ${messageClass}>${row[c] || ""}</td>`).join("") + `</tr>`;
+      const msg = row.message || "";
+      let cls = "";
+      if (msg.includes("failed") || msg.includes("error") || msg.includes("429")) cls = "class=\"err\"";
+      else if (msg.includes("complete") || msg.includes("✅")) cls = "class=\"succ\"";
+      html += `<tr ${cls}>` + columns.map(c => `<td>${row[c] || ""}</td>`).join("") + `</tr>`;
     }
   }
 
-  html += `</table></div>
-</body></html>`;
+  html += `</tbody>
+</table>
+</div>
+</body>
+</html>`;
+
   return new Response(html, {
-    headers: {
-      "Content-Type": "text/html"
-    }
+    headers: { "Content-Type": "text/html; charset=utf-8" }
   });
 }
