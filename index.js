@@ -52,7 +52,7 @@ export default {
       return await serveTable(env, ["The Banana", "The Pirate"], "La-Arena");
     }
     
-    if (pathname === "/894yu3hrjfebncdi7suybj4esnc/all-bookings") {
+    if (pathname === "/894yu3hrjfebncdi7su888ybj4esnc/all-bookings" || pathname === "/894yu3hrjfebncdi7suybj4esnc/all-bookings") {
       return await serveTable(env, [], "All Bookings");
     }
     if (pathname === "/logs") {
