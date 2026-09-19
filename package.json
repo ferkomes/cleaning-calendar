@@ -1,0 +1,13 @@
+{
+  "name": "cleaning-calendar",
+  "version": "1.0.0",
+  "description": "Cleaning Calendar integration with Lodgify & Cloudflare D1",
+  "main": "index.js",
+  "scripts": {
+    "sync": "node sync.js",
+    "deploy": "npx wrangler deploy"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}

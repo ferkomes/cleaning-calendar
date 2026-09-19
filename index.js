@@ -122,7 +122,62 @@ export default {
         return unauthorizedResponse();
       }
 
-      // Szinkronizáció (Sync) indítása (Admin és bejelentkezett takarítók is futtathatják, 5 perc cooldownnal)
+      // 1. Kliens oldali szinkronizáció előkészítése (Token és szűrési adatok átadása)
+      if (action === "start-sync") {
+        const cooldown = await checkSyncCooldown(env);
+        if (!cooldown.allowed) {
+          return new Response(JSON.stringify({
+            allowed: false,
+            message: `⏳ A naptár nemrég frissült. Újabb frissítés ${cooldown.timeStr} múlva indítható.`
+          }), {
+            status: 429,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+        return new Response(JSON.stringify({
+          allowed: true,
+          apiKey: env.LODGIFY_API_KEY,
+          propertiesMap: {
+            569854: "The Albatros",
+            569855: "The Banana",
+            573525: "The Colibri",
+            569856: "The Pirate",
+            569857: "The Tucan"
+          }
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      // 2. Kliens oldali szinkronizált adatok mentése a D1 adatbázisba
+      if ((action === "sync-push" || pathname === "/sync-push") && request.method === "POST") {
+        try {
+          const body = await request.json();
+          const rows = body.rows || [];
+          if (!Array.isArray(rows) || !rows.length) {
+            return new Response(JSON.stringify({ success: false, message: "Nincs mentendő foglalás." }), {
+              status: 400,
+              headers: { "Content-Type": "application/json" }
+            });
+          }
+          await batchUpsertBookings(env, rows);
+          await markSyncDone(env);
+          await logIssue(env, `✅ Sikeres szinkronizáció: ${rows.length} foglalás mentve (${auth.username}).`);
+          return new Response(JSON.stringify({ success: true, count: rows.length }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
+        } catch (err) {
+          await logIssue(env, `Sync push error: ${err.message}`);
+          return new Response(JSON.stringify({ success: false, message: err.message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+      }
+
+      // 3. Szerver oldali szinkronizáció (Fallback ha a kliens közvetlenül hívná)
       if (pathname === "/update" || action === "update") {
         const cooldown = await checkSyncCooldown(env);
         if (!cooldown.allowed) {
@@ -218,7 +273,15 @@ export default {
   }
 };
 
-// --------------------- Lodgify API Integration (v2 Elsődleges, v1 Biztonsági tartalék) ---------------------
+// --------------------- Lodgify API Integration (v1 Elsődleges & Megbízható) ---------------------
+const PROPERTIES_MAP = {
+  569854: "The Albatros",
+  569855: "The Banana",
+  573525: "The Colibri",
+  569856: "The Pirate",
+  569857: "The Tucan"
+};
+
 async function updateAllBookings(env) {
   const apiKey = env.LODGIFY_API_KEY;
   if (!apiKey) throw new Error("LODGIFY_API_KEY nincs beállítva!");
@@ -228,220 +291,164 @@ async function updateAllBookings(env) {
     "Accept": "application/json"
   };
 
-  // 1. Apartman nevek előre definiált statikus térképe (nem terheli felesleges API hívással a Lodgify-t)
-  const propertiesMap = {
-    414841: "The Banana",
-    414842: "The Pirate",
-    414843: "The Tucan",
-    414844: "The Colibri",
-    414845: "The Albatros"
-  };
-
-  // 2. Lodgify v2 Bookings API: Minden adatot egyben visszaad (check_in.time, check_out.time, notes, key_code, guest)
-  try {
-    let page = 1;
-    const size = 50;
-    let totalProcessed = 0;
-
-    while (page <= 10) {
-      const v2Url = `https://api.lodgify.com/v2/reservations/bookings?page=${page}&size=${size}&trash=False`;
-      let resp = await fetch(v2Url, { headers });
-
-      let retries = 0;
-      while (resp.status === 429 && retries < 4) {
-        const retryAfterHeader = resp.headers.get('Retry-After');
-        const waitMs = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : 3500 * (retries + 1);
-        await logIssue(env, `Lodgify 429 rate limit. Waiting ${waitMs}ms before retry #${retries + 1}...`);
-        await delay(waitMs);
-        resp = await fetch(v2Url, { headers });
-        retries++;
-      }
-
-      if (!resp.ok) {
-        throw new Error(`v2 API returned HTTP ${resp.status}`);
-      }
-
-      const data = await resp.json();
-      const items = data?.items || (Array.isArray(data) ? data : []);
-      if (!items || items.length === 0) {
-        break;
-      }
-
-      // Szűrés: Csak az aktív 'Booked' állapotú foglalások
-      const mappedRows = items
-        .filter(item => {
-          const status = (item.status || "").toLowerCase();
-          return status === "booked" && !item.is_deleted && !item.canceled_at;
-        })
-        .map(item => mapBookingV2(item, propertiesMap));
-
-      if (mappedRows.length) {
-        await batchUpsertBookingsV2(env, mappedRows);
-        totalProcessed += mappedRows.length;
-      }
-
-      if (items.length < size) {
-        break; // Utolsó oldal
-      }
-
-      page++;
-      await delay(200); // Rövid szünet a lapozások között
-    }
-
-    await logIssue(env, `✅ Lodgify v2 sync complete: ${totalProcessed} bookings updated across ${page} page(s).`);
-    return { success: true, count: totalProcessed, version: "v2" };
-  } catch (v2Err) {
-    await logIssue(env, `Lodgify v2 sync failed (${v2Err.message}). Starting v1 fallback sync...`);
-  }
-
-  // 3. Biztonsági tartalék (v1 Fallback)
-  return await updateAllBookingsV1Fallback(env, propertiesMap);
-}
-
-// --------------------- Lodgify v1 Fallback ---------------------
-async function updateAllBookingsV1Fallback(env, propertiesMap) {
-  const apiKey = env.LODGIFY_API_KEY;
-  const baseApiUrl = "https://api.lodgify.com/v1/reservation";
-  const headers = { "X-ApiKey": apiKey, "Accept": "application/json" };
-
   const thirtyDaysAgo = new Date();
-  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-  const sixMonthsAhead = new Date();
-  sixMonthsAhead.setMonth(sixMonthsAhead.getMonth() + 6);
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 32);
+  const oneYearAhead = new Date();
+  oneYearAhead.setFullYear(oneYearAhead.getFullYear() + 1);
 
   const periodStart = thirtyDaysAgo.toISOString().slice(0, 10);
-  const periodEnd = sixMonthsAhead.toISOString().slice(0, 10);
+  const periodEnd = oneYearAhead.toISOString().slice(0, 10);
 
   let offset = 0;
   const limit = 50;
-  let totalBookings = 0;
+  const allItems = [];
 
-  while (offset < 300) {
-    const url = `${baseApiUrl}?offset=${offset}&limit=${limit}&trash=false&periodStart=${periodStart}&periodEnd=${periodEnd}`;
+  while (offset < 400) {
+    const url = `https://api.lodgify.com/v1/reservation?offset=${offset}&limit=${limit}&trash=false&periodStart=${periodStart}&periodEnd=${periodEnd}`;
     let resp = await fetch(url, { headers });
 
     let retries = 0;
     while (resp.status === 429 && retries < 3) {
-      await delay(2500 * (retries + 1));
+      const waitMs = 2500 * (retries + 1);
+      await logIssue(env, `Lodgify 429 rate limit (offset=${offset}). Waiting ${waitMs}ms before retry #${retries + 1}...`);
+      await delay(waitMs);
       resp = await fetch(url, { headers });
       retries++;
     }
 
-    if (!resp.ok) break;
+    if (!resp.ok) {
+      throw new Error(`Lodgify API v1 returned HTTP ${resp.status}`);
+    }
+
     const data = await resp.json();
     if (!data || !data.items || !data.items.length) break;
 
-    const items = data.items;
-    const batchRows = items
-      .filter(item => item.status?.toLowerCase() === "booked" && !item.cancellationDate)
-      .map(mapBooking);
-
-    if (batchRows.length) {
-      await batchUpsertBookingsV2(env, batchRows);
-      totalBookings += batchRows.length;
-    }
-
-    if (items.length < limit) break;
+    allItems.push(...data.items);
+    if (data.items.length < limit) break;
     offset += limit;
-    await delay(250);
+    await delay(200);
   }
 
-  await logIssue(env, `v1 fallback sync completed: ${totalBookings} bookings.`);
-  return { success: true, count: totalBookings, version: "v1-fallback" };
+  // Szűrés: Csak az aktív 'Booked' állapotú foglalások és zárt időszakok (Declined, Cancelled, töröltek kizárva)
+  const validBookings = allItems.filter(item => {
+    const status = (item.status || "").toLowerCase();
+    return status === "booked" && !item.cancellationDate && !item.is_deleted;
+  });
+
+  const mappedRows = validBookings.map(item => mapBooking(item, PROPERTIES_MAP));
+
+  if (mappedRows.length) {
+    await batchUpsertBookings(env, mappedRows);
+    const validIds = mappedRows.map(r => r.booking_id);
+    await pruneStaleBookings(env, validIds, periodStart);
+  }
+
+  await logIssue(env, `✅ Lodgify szinkronizáció sikeres: ${mappedRows.length} aktív foglalás és időszak frissítve.`);
+  return { success: true, count: mappedRows.length, version: "v1" };
 }
 
 // --------------------- Mapping and Batch Upsert ---------------------
-function mapBookingV2(item, propertiesMap) {
+function mapBooking(item, propertiesMap = PROPERTIES_MAP) {
   const guest = item.guest || {};
-  const room = (item.rooms && item.rooms[0]) || {};
-  const breakdown = room.guest_breakdown || {};
+  const breakdown = item.total_guest_breakdown || (item.rooms && item.rooms[0]?.guest_breakdown) || {};
   const people = [
     breakdown.adults ? `${breakdown.adults} adult${breakdown.adults > 1 ? "s" : ""}` : "",
     breakdown.children ? `${breakdown.children} child${breakdown.children > 1 ? "ren" : ""}` : "",
     breakdown.infants ? `${breakdown.infants} infant${breakdown.infants > 1 ? "s" : ""}` : ""
-  ].filter(Boolean).join(", ");
+  ].filter(Boolean).join(", ") || (item.people ? `${item.people} adult${item.people > 1 ? "s" : ""}` : "");
 
   const guestPhone = guest.phone || "";
   const rawLockbox = String(guestPhone).replace(/[^0-9]/g, '');
   const lockboxFromPhone = rawLockbox.slice(-4) || "";
-  const lockboxCode = room.key_code || lockboxFromPhone || "";
+  const lockbox = (item.rooms && item.rooms[0]?.key_code) || lockboxFromPhone || "";
 
   const propName = propertiesMap[item.property_id] || item.property_name || `Property #${item.property_id}`;
-  const checkInTime = item.check_in?.time || "";
-  const checkOutTime = item.check_out?.time || "";
-  const note = item.notes ? cleanNote(item.notes) : "";
+  const guestName = guest.name || (item.type === "ClosedPeriod" ? "Closed" : "");
 
   return {
-    booking_id: parseInt(item.id, 10) || item.id,
+    booking_id: String(item.id).replace('.0', ''),
     property_name: propName,
     people,
-    guest_name: guest.name || "",
-    guest_phone: guestPhone,
-    lockbox_code: lockboxCode,
-    check_in_date: item.arrival ? item.arrival.slice(0, 10) : "",
-    check_in_time: checkInTime,
-    departure: item.departure ? item.departure.slice(0, 10) : "",
-    check_out_time: checkOutTime,
-    note: note,
-    detail_status: "DONE"
-  };
-}
-
-function mapBooking(booking) {
-  const guest = booking.guest || {};
-  const breakdown = booking.total_guest_breakdown || {};
-  const people = [
-    breakdown.adults ? `${breakdown.adults} adult${breakdown.adults > 1 ? "s" : ""}` : "",
-    breakdown.children ? `${breakdown.children} child${breakdown.children > 1 ? "ren" : ""}` : "",
-    breakdown.infants ? `${breakdown.infants} infant${breakdown.infants > 1 ? "s" : ""}` : ""
-  ].filter(Boolean).join(", ");
-  const guestPhone = guest.phone || "";
-  const rawLockbox = String(guestPhone).replace(/[^0-9]/g, '');
-  const lockbox = rawLockbox.slice(-4) || "";
-  return {
-    booking_id: parseInt(booking.id, 10) || "",
-    property_name: booking.property_name || "",
-    people,
-    guest_name: guest.name || "",
+    guest_name: guestName,
     guest_phone: guestPhone,
     lockbox_code: lockbox,
-    check_in_date: booking.arrival ? booking.arrival.slice(0, 10) : "",
-    check_in_time: booking.check_in?.time || "",
-    departure: booking.departure ? booking.departure.slice(0, 10) : "",
-    check_out_time: booking.check_out?.time || "",
-    note: booking.note ? cleanNote(booking.note) : "",
+    check_in_date: item.arrival ? item.arrival.slice(0, 10) : "",
+    check_in_time: item.check_in?.time || "16:00:00",
+    departure: item.departure ? item.departure.slice(0, 10) : "",
+    check_out_time: item.check_out?.time || "11:00:00",
+    note: item.note ? cleanNote(item.note) : "",
     detail_status: "DONE"
   };
 }
 
-async function batchUpsertBookingsV2(env, rows, chunkSize = 10) {
+async function batchUpsertBookings(env, rows) {
   if (!rows.length) return;
-  const columns = Object.keys(rows[0]);
+  const sql = `
+    INSERT INTO bookings (
+      booking_id, property_name, people, guest_name, guest_phone,
+      lockbox_code, check_in_date, check_in_time, departure, check_out_time, note, detail_status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(booking_id) 
+    DO UPDATE SET
+      property_name = excluded.property_name,
+      people = excluded.people,
+      guest_name = excluded.guest_name,
+      guest_phone = excluded.guest_phone,
+      lockbox_code = CASE WHEN excluded.lockbox_code != '' THEN excluded.lockbox_code ELSE bookings.lockbox_code END,
+      check_in_date = excluded.check_in_date,
+      check_in_time = CASE WHEN excluded.check_in_time != '' THEN excluded.check_in_time ELSE bookings.check_in_time END,
+      departure = excluded.departure,
+      check_out_time = CASE WHEN excluded.check_out_time != '' THEN excluded.check_out_time ELSE bookings.check_out_time END,
+      note = CASE WHEN excluded.note != '' THEN excluded.note ELSE bookings.note END,
+      detail_status = 'DONE'
+  `;
 
-  for (let i = 0; i < rows.length; i += chunkSize) {
-    const chunk = rows.slice(i, i + chunkSize);
-    const placeholders = chunk.map(_ => `(${columns.map(_ => "?").join(",")})`).join(",");
-    const values = chunk.flatMap(r => Object.values(r));
+  const BATCH_SIZE = 25;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const statements = chunk.map(r => env.DB.prepare(sql).bind(
+      String(r.booking_id).replace('.0', ''),
+      r.property_name || '',
+      r.people || '',
+      r.guest_name || '',
+      r.guest_phone || '',
+      r.lockbox_code || '',
+      r.check_in_date || '',
+      r.check_in_time || '16:00:00',
+      r.departure || '',
+      r.check_out_time || '11:00:00',
+      r.note || '',
+      r.detail_status || 'DONE'
+    ));
+    await env.DB.batch(statements);
+  }
+}
 
-    const sql = `
-      INSERT INTO bookings (${columns.join(",")})
-      VALUES ${placeholders}
-      ON CONFLICT(booking_id) 
-      DO UPDATE SET
-        property_name = excluded.property_name,
-        people = excluded.people,
-        guest_name = excluded.guest_name,
-        guest_phone = excluded.guest_phone,
-        lockbox_code = CASE WHEN excluded.lockbox_code != '' THEN excluded.lockbox_code ELSE lockbox_code END,
-        check_in_date = excluded.check_in_date,
-        check_in_time = CASE WHEN excluded.check_in_time != '' THEN excluded.check_in_time ELSE check_in_time END,
-        departure = excluded.departure,
-        check_out_time = CASE WHEN excluded.check_out_time != '' THEN excluded.check_out_time ELSE check_out_time END,
-        note = CASE WHEN excluded.note != '' THEN excluded.note ELSE note END,
-        detail_status = 'DONE'
-    `;
+async function pruneStaleBookings(env, validIds, periodStart) {
+  if (!validIds || !validIds.length) return;
+  try {
+    const existing = await env.DB.prepare(
+      "SELECT booking_id FROM bookings WHERE departure >= ?"
+    ).bind(periodStart).all();
 
-    await env.DB.prepare(sql).bind(...values).run();
+    const validSet = new Set(validIds.map(id => String(id).replace('.0', '')));
+    const idsToDelete = (existing.results || [])
+      .map(r => String(r.booking_id))
+      .filter(id => !validSet.has(id.replace('.0', '')));
+
+    if (idsToDelete.length > 0) {
+      const BATCH_SIZE = 25;
+      for (let i = 0; i < idsToDelete.length; i += BATCH_SIZE) {
+        const chunk = idsToDelete.slice(i, i + BATCH_SIZE);
+        const statements = chunk.map(id =>
+          env.DB.prepare("DELETE FROM bookings WHERE booking_id = ?").bind(id)
+        );
+        await env.DB.batch(statements);
+      }
+      await logIssue(env, `🧹 Törölve ${idsToDelete.length} lemondott/stale foglalás.`);
+    }
+  } catch (err) {
+    console.error("Prune error:", err);
   }
 }
 
