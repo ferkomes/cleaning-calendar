@@ -596,7 +596,7 @@ tr:nth-child(even){background:#fafafa;}
 @media(max-width:600px){table,th,td{font-size:12px;padding:4px;}}
 </style>
 </head><body>
-<h2>\${title}</h2>
+<h2>${title}</h2>
 `;
   if (title === "All Bookings") {
     html += `<button id="updateBtn" onclick="updateTable()">Update All Bookings</button>
@@ -604,7 +604,7 @@ tr:nth-child(even){background:#fafafa;}
   }
 
   html += `<div id="syncMsg"></div>
-\${statusMsg?\`<div id="detailsProcessing">\${statusMsg}</div>\`:\`\`}
+${statusMsg?`<div id="detailsProcessing">${statusMsg}</div>`:``}
 `; 
 
   // --- COLUMN SELECTION FORM VISSZAÁLLÍTVA AZ ADMIN FELÜLETRE ---
@@ -619,10 +619,10 @@ tr:nth-child(even){background:#fafafa;}
     <p>Ezek a linkek most a Worker egyszerű elérési útját használják. Naptár programokba való beillesztéskor a böngésző megnyitásával ellenőrizhető a tartalom.</p>
     
     <p>**La-Arena iCal Link:**</p>
-    <code style="font-family:monospace; background:#fff; padding:5px; border:1px solid #ddd; word-break:break-all; display:block; margin-bottom:8px;">https://\${host}/la-arena-ical</code>
+    <code style="font-family:monospace; background:#fff; padding:5px; border:1px solid #ddd; word-break:break-all; display:block; margin-bottom:8px;">https://${host}/la-arena-ical</code>
 
     <p>**Golf-del-Sur iCal Link:**</p>
-    <code style="font-family:monospace; background:#fff; padding:5px; border:1px solid #ddd; word-break:break-all; display:block; margin-bottom:8px;">https://\${host}/golf-del-sur-ical</code>
+    <code style="font-family:monospace; background:#fff; padding:5px; border:1px solid #ddd; word-break:break-all; display:block; margin-bottom:8px;">https://${host}/golf-del-sur-ical</code>
     <p style="font-size:12px; margin-top: 5px;">*A linket másolja ki, és illessze be a takarító csapat naptárrendszerébe (pl. Google Calendar, Outlook).*</p>
 </div>
 <hr>
@@ -637,13 +637,13 @@ tr:nth-child(even){background:#fafafa;}
     <h4>La-Arena Columns</h4>
     <form id="laArenaForm">
       <input type="hidden" name="name" value="La-Arena-Columns">
-      \${columns.map(c => \`
+      ${columns.map(c => `
         <div>
-          <input type="checkbox" name="column" value="\${c}" id="la-\${c}" 
-            \${laArenaCols.includes(c) ? 'checked' : ''}>
-          <label for="la-\${c}">\${c}</label>
+          <input type="checkbox" name="column" value="${c}" id="la-${c}" 
+            ${laArenaCols.includes(c) ? 'checked' : ''}>
+          <label for="la-${c}">${c}</label>
         </div>
-      \`).join('')}
+      `).join('')}
       <button type="button" onclick="saveSettings('laArenaForm')">Save La-Arena</button>
     </form>
   </div>
@@ -652,13 +652,13 @@ tr:nth-child(even){background:#fafafa;}
     <h4>Golf-del-Sur Columns</h4>
     <form id="golfForm">
       <input type="hidden" name="name" value="Golf-del-Sur-Columns">
-      \${columns.map(c => \`
+      ${columns.map(c => `
         <div>
-          <input type="checkbox" name="column" value="\${c}" id="golf-\${c}" 
-            \${golfDelSurCols.includes(c) ? 'checked' : ''}>
-          <label for="golf-\${c}">\${c}</label>
+          <input type="checkbox" name="column" value="${c}" id="golf-${c}" 
+            ${golfDelSurCols.includes(c) ? 'checked' : ''}>
+          <label for="golf-${c}">${c}</label>
         </div>
-      \`).join('')}
+      `).join('')}
       <button type="button" onclick="saveSettings('golfForm')">Save Golf-del-Sur</button>
     </form>
   </div>
@@ -674,13 +674,13 @@ tr:nth-child(even){background:#fafafa;}
     const isHidden = !isAllBookings && !currentVisibleCols.includes(c);
     const style = isHidden ? 'style="display:none;"' : '';
     
-    const checkbox = isAllBookings ? \`<input type="checkbox" \${currentVisibleCols.includes(c) ? 'checked' : ''} onchange="toggleColumn(event,'\${c}')">\` : '';
+    const checkbox = isAllBookings ? `<input type="checkbox" ${currentVisibleCols.includes(c) ? 'checked' : ''} onchange="toggleColumn(event,'${c}')">` : '';
     
-    return \`<th \${style}>\${checkbox}\${c}</th>\`;
+    return `<th ${style}>${checkbox}${c}</th>`;
   }).join("");
 
 
-  html += \`<div class="container"><table id="bookingTable"><tr>\${headerHtml}</tr>\`;
+  html += `<div class="container"><table id="bookingTable"><tr>${headerHtml}</tr>`;
 
   for (const row of rows.results) {
     const arrival = new Date(row.check_in_date);
@@ -697,14 +697,14 @@ tr:nth-child(even){background:#fafafa;}
       cls = "grey";
     }
 
-    html += \`<tr class="\${cls}">\` + columns.map(c => {
+    html += `<tr class="${cls}">` + columns.map(c => {
       const isHidden = !isAllBookings && !currentVisibleCols.includes(c);
       const style = isHidden ? 'style="display:none;"' : '';
-      return \`<td \${style}>\${row[c]||""}</td>\`;
-    }).join("") + \`</tr>\`;
+      return `<td ${style}>${row[c]||""}</td>`;
+    }).join("") + `</tr>`;
   }
 
-  html += \`</table></div>
+  html += `</table></div>
 <script>
 // A Host nevet frissítő és a Token regeneráló funkciók ELTÁVOLÍTVA
 // Visszaállítva az egyszerűbb onload-ra
@@ -780,7 +780,7 @@ async function saveSettings(formId) {
   }
 }
 </script>
-</body></html>\`;
+</body></html>`;
   return new Response(html, {
     headers: {
       "Content-Type": "text/html"
@@ -801,12 +801,12 @@ async function handleSettingsPost(request, env) {
     const value = JSON.stringify(columns);
     
     await env.DB.prepare(
-      \`INSERT INTO settings (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value=excluded.value\`
+      `INSERT INTO settings (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value=excluded.value`
     ).bind(name, value).run();
     
     return new Response("Settings saved", { status: 200 });
   } catch (err) {
-    await logIssue(env, \`Failed to save settings: \${err.message}\`);
+    await logIssue(env, `Failed to save settings: ${err.message}`);
     return new Response("Internal Server Error", { status: 500 });
   }
 }
@@ -815,7 +815,7 @@ async function handleSettingsPost(request, env) {
 async function logIssue(env, message, bookingId = null) {
   try {
     await env.DB.prepare(
-      \`INSERT INTO logs (message, booking_id, timestamp) VALUES (?, ?, ?)\`
+      `INSERT INTO logs (message, booking_id, timestamp) VALUES (?, ?, ?)`
     ).bind(message, bookingId, new Date().toISOString()).run();
   } catch (err) {
     console.error("Failed to log issue to DB:", err);
@@ -827,7 +827,7 @@ async function serveLogs(env) {
 
   const columns = ["timestamp", "booking_id", "message"];
 
-  let html = \`<html><head>
+  let html = `<html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
@@ -841,17 +841,17 @@ tr:nth-child(even){background:#fafafa;}
 </head><body>
 <h2>System Logs</h2>
 <a href="/all-bookings"><button>Back to Bookings</button></a>
-<div class="container"><table id="logTable"><tr>\${columns.map(c=>\`<th>\${c}</th>\`).join("")}</tr>\`;
+<div class="container"><table id="logTable"><tr>${columns.map(c=>`<th>${c}</th>`).join("")}</tr>`;
 
   if (result.results) {
     for (const row of result.results) {
       const messageClass = row.message && row.message.includes("Too many subrequests") ? 'style="background-color: #fdd; font-weight: bold;"' : '';
-      html += \`<tr>\` + columns.map(c => \`<td \${messageClass}>\${row[c] || ""}</td>\`).join("") + \`</tr>\`;
+      html += `<tr>` + columns.map(c => `<td ${messageClass}>${row[c] || ""}</td>`).join("") + `</tr>`;
     }
   }
 
-  html += \`</table></div>
-</body></html>\`;
+  html += `</table></div>
+</body></html>`;
   return new Response(html, {
     headers: {
       "Content-Type": "text/html"

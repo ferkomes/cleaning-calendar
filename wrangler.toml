@@ -1,0 +1,8 @@
+name = "cleaning-schedule"
+main = "index.js"
+compatibility_date = "2024-09-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cleaning-data-sheet"
+database_id = "d43a52bb-6818-4006-83ae-be1367d0d681"
