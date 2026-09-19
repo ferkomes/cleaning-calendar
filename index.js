@@ -14,34 +14,26 @@ function authenticateUser(request) {
     const colonIndex = decoded.indexOf(":");
     if (colonIndex === -1) return null;
     const rawUser = decoded.substring(0, colonIndex).trim();
-    const user = rawUser.toLowerCase();
-    const pass = decoded.substring(colonIndex + 1);
+    const pass = decoded.substring(colonIndex + 1).trim();
+
+    if (rawUser === "invalid_user_logout") {
+      return null;
+    }
 
     // 1. Admin (Jelszó: Kurvaanyad1!)
-    if (pass === "Kurvaanyad1!" && (
-      user === "admin" || user === "ferkomes" || user === "ferenc" || user === ""
-    )) {
+    if (pass === "Kurvaanyad1!") {
       return { role: "admin", username: rawUser || "Admin" };
     }
 
     // 2. LaArena / Kata (Jelszó: Kata1!)
-    if (pass === "Kata1!" && (
-      user === "laarena" || user === "la-arena" || user === "kata" || user === ""
-    )) {
+    if (pass === "Kata1!") {
       return { role: "la-arena", username: "Kata (La-Arena)" };
     }
 
     // 3. GolfDelSur / Gábor (Jelszó: Gabor1!)
-    if (pass === "Gabor1!" && (
-      user === "golfdelsur" || user === "golf-del-sur" || user === "gabor" || user === "gábor" || user === ""
-    )) {
+    if (pass === "Gabor1!") {
       return { role: "golf-del-sur", username: "Gábor (Golf-del-Sur)" };
     }
-
-    // Fallback ha a jelszó egyértelműen stimmel
-    if (pass === "Kurvaanyad1!") return { role: "admin", username: rawUser || "Admin" };
-    if (pass === "Kata1!") return { role: "la-arena", username: "Kata (La-Arena)" };
-    if (pass === "Gabor1!") return { role: "golf-del-sur", username: "Gábor (Golf-del-Sur)" };
 
     return null;
   } catch (e) {
@@ -111,13 +103,17 @@ export default {
       }
       // ---------------------------------------------------------------------
 
-      // Kijelentkezés (Basic Auth böngésző cache törlése)
-      if (action === "logout" || pathname === "/logout") {
-        return unauthorizedResponse("Sikeresen kijelentkeztél. Újbóli belépéshez töltsd újra az oldalt vagy add meg az új bejelentkezési adatokat.");
-      }
-
       // HTTP Basic Authentication ellenőrzése
       const auth = authenticateUser(request);
+
+      // Kijelentkezés
+      if (action === "logout" || pathname === "/logout") {
+        if (auth) {
+          return Response.redirect(url.origin + pathname, 302);
+        }
+        return unauthorizedResponse("Sikeresen kijelentkeztél. Újbóli belépéshez add meg a bejelentkezési adatokat.");
+      }
+
       if (!auth) {
         return unauthorizedResponse();
       }
@@ -950,11 +946,11 @@ window.onload = function() {
 async function logout() {
   if (!confirm("Biztosan ki szeretnél jelentkezni?")) return;
   try {
-    await fetch(window.location.pathname + "?action=logout", {
-      headers: { "Authorization": "Basic " + btoa("logout:logout") }
+    await fetch(window.location.origin + window.location.pathname, {
+      headers: { "Authorization": "Basic " + btoa("invalid_user_logout:logout") }
     });
   } catch (e) {}
-  window.location.href = window.location.pathname + "?action=logout";
+  window.location.href = window.location.origin + window.location.pathname;
 }
 
 // Szinkronizálás (Sync)

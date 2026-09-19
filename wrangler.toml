@@ -13,4 +13,4 @@ database_name = "cleaning-data-sheet"
 database_id = "d43a52bb-6818-4006-83ae-be1367d0d681"
 
 [triggers]
-crons = ["0 6,18 * * *"]
+crons = ["0 2 * * *"]
