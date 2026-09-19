@@ -1,21 +1,102 @@
-// Build version: 2026-09-19-build-1 (Routes updated for secret prefix with 888)
+// Build version: 2026-09-19-build-2 (Role-based Authentication for Admin, Kata, and Gabor)
 let detailsStatus = "idle";
 // idle | processing | done | stopped | failed
+
+function authenticateUser(request) {
+  const authHeader = request.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Basic ")) {
+    return null;
+  }
+  try {
+    const base64Credentials = authHeader.substring(6).trim();
+    const decoded = atob(base64Credentials);
+    const colonIndex = decoded.indexOf(":");
+    if (colonIndex === -1) return null;
+    const rawUser = decoded.substring(0, colonIndex).trim();
+    const user = rawUser.toLowerCase();
+    const pass = decoded.substring(colonIndex + 1);
+
+    // 1. Admin (Jelszó: Kurvaanyad1!)
+    if (pass === "Kurvaanyad1!" && (
+      user === "admin" || user === "ferkomes" || user === "ferenc" || user === ""
+    )) {
+      return { role: "admin", username: rawUser || "Admin" };
+    }
+
+    // 2. LaArena / Kata (Jelszó: Kata1!)
+    if (pass === "Kata1!" && (
+      user === "laarena" || user === "la-arena" || user === "kata" || user === ""
+    )) {
+      return { role: "la-arena", username: "Kata (La-Arena)" };
+    }
+
+    // 3. GolfDelSur / Gábor (Jelszó: Gabor1!)
+    if (pass === "Gabor1!" && (
+      user === "golfdelsur" || user === "golf-del-sur" || user === "gabor" || user === "gábor" || user === ""
+    )) {
+      return { role: "golf-del-sur", username: "Gábor (Golf-del-Sur)" };
+    }
+
+    // Fallback ha csak a jelszó egyezik egyértelműen
+    if (pass === "Kurvaanyad1!") return { role: "admin", username: rawUser || "Admin" };
+    if (pass === "Kata1!") return { role: "la-arena", username: "Kata (La-Arena)" };
+    if (pass === "Gabor1!") return { role: "golf-del-sur", username: "Gábor (Golf-del-Sur)" };
+
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function unauthorizedResponse() {
+  return new Response("Access Denied: Authentication required.", {
+    status: 401,
+    headers: {
+      "WWW-Authenticate": 'Basic realm="Cleaning Calendar", charset="UTF-8"',
+      "Content-Type": "text/plain; charset=utf-8"
+    }
+  });
+}
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const pathname = url.pathname;
+    const view = url.searchParams.get("view");
+    const host = request.headers.get('host') || 'worker.default.tld';
 
+    // --- ICAL ROUTES VISSZAÁLLÍTVA (TOKEN NÉLKÜL - Naptár szinkronizációhoz publikus) ---
+    if (pathname === "/golf-del-sur-ical") {
+      return await serveIcalFeed(env, ["The Tucan", "The Colibri", "The Albatros"], "Golf-del-Sur-Columns", host);
+    }
+    if (pathname === "/la-arena-ical") {
+      return await serveIcalFeed(env, ["The Banana", "The Pirate"], "La-Arena-Columns", host);
+    }
+    // -------------------------------------------------------------------------------------
+
+    // HTTP Basic Authentication ellenőrzése
+    const auth = authenticateUser(request);
+    if (!auth) {
+      return unauthorizedResponse();
+    }
+
+    // 1. Szerepkör: Kata (La-Arena) -> Kizárólag Banana és Pirate apartmanok
+    if (auth.role === "la-arena") {
+      return await serveTable(env, ["The Banana", "The Pirate"], "La-Arena", auth);
+    }
+
+    // 2. Szerepkör: Gábor (Golf-del-Sur) -> Kizárólag Tucan, Colibri, Albatros apartmanok
+    if (auth.role === "golf-del-sur") {
+      return await serveTable(env, ["The Tucan", "The Colibri", "The Albatros"], "Golf-del-Sur", auth);
+    }
+
+    // 3. Szerepkör: Admin -> Teljes hozzáférés
     if (pathname === "/update") {
       try {
         await logIssue(env, "Starting full sync (Past/Future) and detail fetch for all missing entries.");
         detailsStatus = "processing";
-        // Step 1: Sync all relevant bookings (past 32 days and 6 months future)
         const allBookingIds = await updateAllBookings(env); 
-        // Step 2: Start prioritized detailed fetch in background
         ctx.waitUntil(startDetailedFetch(env));
-        
         return new Response("✅ Full bookings sync complete. Detailed fetch for missing entries is running in the background.", {
           status: 200
         });
@@ -27,41 +108,25 @@ export default {
         });
       }
     }
-    
-    // NEW: Handle column settings POST request
+
     if (pathname === "/save-settings" && request.method === "POST") {
-        return handleSettingsPost(request, env);
+      return handleSettingsPost(request, env);
     }
-    
-    // --- ICAL ROUTES VISSZAÁLLÍTVA (TOKEN NÉLKÜL) ---
-    const host = request.headers.get('host') || 'worker.default.tld';
-    
-    if (pathname === "/golf-del-sur-ical") {
-      // Visszaállítva a régi, egyszerű linkre
-      return await serveIcalFeed(env, ["The Tucan", "The Colibri", "The Albatros"], "Golf-del-Sur-Columns", host);
-    }
-    if (pathname === "/la-arena-ical") {
-      // Visszaállítva a régi, egyszerű linkre
-      return await serveIcalFeed(env, ["The Banana", "The Pirate"], "La-Arena-Columns", host);
-    }
-    // --------------------------------------------------
-    
-    if (pathname === "/golf-del-sur") {
-      return await serveTable(env, ["The Tucan", "The Colibri", "The Albatros"], "Golf-del-Sur");
-    }
-    if (pathname === "/la-arena") {
-      return await serveTable(env, ["The Banana", "The Pirate"], "La-Arena");
-    }
-    
-    if (pathname === "/894yu3hrjfebncdi7su888ybj4esnc/all-bookings" || pathname === "/894yu3hrjfebncdi7suybj4esnc/all-bookings") {
-      return await serveTable(env, [], "All Bookings");
-    }
-    if (pathname === "/logs") {
+
+    if (pathname === "/logs" || view === "logs") {
       return await serveLogs(env);
     }
-    return new Response("Not found", {
-      status: 404
-    });
+
+    if (pathname === "/la-arena" || view === "la-arena") {
+      return await serveTable(env, ["The Banana", "The Pirate"], "La-Arena", auth);
+    }
+
+    if (pathname === "/golf-del-sur" || view === "golf-del-sur") {
+      return await serveTable(env, ["The Tucan", "The Colibri", "The Albatros"], "Golf-del-Sur", auth);
+    }
+
+    // Alapértelmezett nézet Adminnak: All Bookings
+    return await serveTable(env, [], "All Bookings", auth);
   },
   
   // CRON: Cron Trigger Handler (Clears logs on minute 0 run)
@@ -506,7 +571,7 @@ async function serveIcalFeed(env, properties, settingName, host) {
 
 
 // --------------------- serve table (ICAL SECURITY SECTION ELTÁVOLÍTVA) ---------------------
-async function serveTable(env, properties, title) {
+async function serveTable(env, properties, title, authUser = null) {
   let whereClause = "";
   let bindParams = [];
   if (properties.length) {
@@ -546,8 +611,6 @@ async function serveTable(env, properties, title) {
   const laArenaSettingsResult = await env.DB.prepare("SELECT value FROM settings WHERE name = 'La-Arena-Columns'").first();
   const golfDelSurSettingsResult = await env.DB.prepare("SELECT value FROM settings WHERE name = 'Golf-del-Sur-Columns'").first();
   
-  // TOKEN ELTÁVOLÍTVA: const icalTokenResult = await env.DB.prepare("SELECT value FROM settings WHERE name = 'ICAL_SECURITY_TOKEN'").first();
-  
   let laArenaCols = columns;
   let golfDelSurCols = columns;
 
@@ -570,19 +633,24 @@ async function serveTable(env, properties, title) {
   }
 
   let currentVisibleCols = columns; 
-  if (title === "La-Arena" && laArenaCols.length) {
+  if (title.includes("La-Arena") && laArenaCols.length) {
     currentVisibleCols = laArenaCols;
-  } else if (title === "Golf-del-Sur" && golfDelSurCols.length) {
+  } else if (title.includes("Golf-del-Sur") && golfDelSurCols.length) {
     currentVisibleCols = golfDelSurCols;
   }
   // --- END Column Selection Logic ---
+
+  const isAllBookings = title === "All Bookings";
+  const isAdmin = authUser && authUser.role === "admin";
 
   let html = `<html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 body{font-family:Arial;margin:10px;}
-button{padding:10px 15px;margin-bottom:10px;font-size:14px;cursor:pointer;border-radius:4px;}
+button{padding:8px 14px;margin-bottom:8px;font-size:13px;cursor:pointer;border-radius:4px;border:1px solid #ccc;background:#f5f5f5;}
+button:hover{background:#e8e8e8;}
+.nav-active{background:#0070f3 !important; color:white !important; border-color:#0070f3 !important;}
 table{border-collapse:collapse;width:100%;font-size:14px;}
 th,td{border:1px solid #ccc;padding:6px;text-align:left;}
 th{background:#f2f2f2;}
@@ -596,11 +664,21 @@ tr:nth-child(even){background:#fafafa;}
 @media(max-width:600px){table,th,td{font-size:12px;padding:4px;}}
 </style>
 </head><body>
-<h2>${title}</h2>
+<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; margin-bottom:12px; border-bottom:1px solid #ddd; padding-bottom:8px;">
+  <h2 style="margin:0;">${title}</h2>
+  ${authUser ? `<div style="font-size:13px; color:#555;">👤 Bejelentkezve: <strong>${authUser.username}</strong></div>` : ``}
+</div>
 `;
-  if (title === "All Bookings") {
-    html += `<button id="updateBtn" onclick="updateTable()">Update All Bookings</button>
-<a href="/logs"><button>View Logs</button></a>`;
+
+  if (isAdmin) {
+    html += `
+    <div style="margin-bottom: 12px; display: flex; gap: 8px; flex-wrap: wrap;">
+      <a href="?view=all"><button class="${title === 'All Bookings' ? 'nav-active' : ''}">Összes apartman</button></a>
+      <a href="?view=la-arena"><button class="${title.includes('La-Arena') ? 'nav-active' : ''}">La-Arena (Kata)</button></a>
+      <a href="?view=golf-del-sur"><button class="${title.includes('Golf-del-Sur') ? 'nav-active' : ''}">Golf-del-Sur (Gábor)</button></a>
+      <a href="/logs"><button>View Logs</button></a>
+      <button id="updateBtn" onclick="updateTable()" style="background:#28a745; color:white; border-color:#28a745;">Frissítés (Sync)</button>
+    </div>`;
   }
 
   html += `<div id="syncMsg"></div>
@@ -608,7 +686,7 @@ ${statusMsg?`<div id="detailsProcessing">${statusMsg}</div>`:``}
 `; 
 
   // --- COLUMN SELECTION FORM VISSZAÁLLÍTVA AZ ADMIN FELÜLETRE ---
-  if (title === "All Bookings") {
+  if (isAdmin && title === "All Bookings") {
     // Visszaállítva a korábbi, egyszerű ICAL linkek bemutatására
     const host = "worker.default.tld"; // Csak placeholder, a böngésző fogja behelyettesíteni
 
@@ -668,8 +746,6 @@ ${statusMsg?`<div id="detailsProcessing">${statusMsg}</div>`:``}
   // --- END NEW FORM AND SECURITY SECTION ---
 
   // --- Start Table with Dynamic Header/Content ---
-  const isAllBookings = title === "All Bookings";
-  
   const headerHtml = columns.map(c => {
     const isHidden = !isAllBookings && !currentVisibleCols.includes(c);
     const style = isHidden ? 'style="display:none;"' : '';
