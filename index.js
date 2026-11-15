@@ -157,16 +157,55 @@ export default {
               headers: { "Content-Type": "application/json" }
             });
           }
+          const { unnotifiedBookings } = await getUnnotifiedGolfBookings(env, rows);
           await batchUpsertBookings(env, rows);
           await markSyncDone(env);
           await logIssue(env, `✅ Sikeres szinkronizáció: ${rows.length} foglalás mentve (${auth.username}).`);
-          return new Response(JSON.stringify({ success: true, count: rows.length }), {
+          return new Response(JSON.stringify({
+            success: true,
+            count: rows.length,
+            pendingNotifications: unnotifiedBookings
+          }), {
             status: 200,
             headers: { "Content-Type": "application/json" }
           });
         } catch (err) {
           await logIssue(env, `Sync push error: ${err.message}`);
           return new Response(JSON.stringify({ success: false, message: err.message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+      }
+
+      // 2.1 Értesítések rögzítése (ha kliens oldalon már sikeresen kiküldték a levelet)
+      if ((action === "mark-notified" || pathname === "/mark-notified") && request.method === "POST") {
+        try {
+          const body = await request.json();
+          const items = body.items || [];
+          for (const it of items) {
+            const bId = String(it.booking_id).replace('.0', '');
+            await env.DB.prepare(`
+              INSERT INTO email_notifications (booking_id, property_name, guest_name, check_in_date, departure, sent_at, recipient, status)
+              VALUES (?, ?, ?, ?, ?, datetime('now'), ?, 'sent')
+              ON CONFLICT(booking_id) DO UPDATE SET sent_at = excluded.sent_at, status = 'sent'
+            `).bind(
+              bId,
+              it.property_name || '',
+              it.guest_name || '',
+              it.check_in_date || '',
+              it.departure || '',
+              GOLF_DEL_SUR_NOTIFICATION_EMAIL
+            ).run();
+            await logIssue(env, `📧 Email értesítő sikeresen elküldve új foglalásról: #${bId} (${it.property_name}, ${it.guest_name}) -> ${GOLF_DEL_SUR_NOTIFICATION_EMAIL}`);
+          }
+          return new Response(JSON.stringify({ success: true, count: items.length }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
+        } catch (err) {
+          await logIssue(env, `Mark notified error: ${err.message}`);
+          return new Response(JSON.stringify({ success: false, error: err.message }), {
             status: 500,
             headers: { "Content-Type": "application/json" }
           });
@@ -331,7 +370,28 @@ async function updateAllBookings(env) {
     return status === "booked" && !item.cancellationDate && !item.is_deleted;
   });
 
-  const mappedRows = validBookings.map(item => mapBooking(item, PROPERTIES_MAP));
+  // Notes lekérése Lodgify v2 API-ból
+  const notesMap = new Map();
+  try {
+    let v2Page = 1;
+    while (v2Page <= 3) {
+      const v2Url = `https://api.lodgify.com/v2/reservations/bookings?page=${v2Page}&size=50&trash=False`;
+      const v2Resp = await fetch(v2Url, { headers });
+      if (!v2Resp.ok) break;
+      const v2Data = await v2Resp.json();
+      if (!v2Data || !v2Data.items || !v2Data.items.length) break;
+      for (const it of v2Data.items) {
+        const noteText = cleanNote(it.notes);
+        if (noteText) notesMap.set(String(it.id).replace('.0', ''), noteText);
+      }
+      if (v2Data.items.length < 50) break;
+      v2Page++;
+    }
+  } catch (err) {
+    console.warn("Worker v2 notes fetch warning:", err.message);
+  }
+
+  const mappedRows = validBookings.map(item => mapBooking(item, PROPERTIES_MAP, notesMap));
 
   if (mappedRows.length) {
     await batchUpsertBookings(env, mappedRows);
@@ -344,7 +404,7 @@ async function updateAllBookings(env) {
 }
 
 // --------------------- Mapping and Batch Upsert ---------------------
-function mapBooking(item, propertiesMap = PROPERTIES_MAP) {
+function mapBooking(item, propertiesMap = PROPERTIES_MAP, notesMap = new Map()) {
   const guest = item.guest || {};
   const breakdown = item.total_guest_breakdown || (item.rooms && item.rooms[0]?.guest_breakdown) || {};
   const people = [
@@ -361,8 +421,11 @@ function mapBooking(item, propertiesMap = PROPERTIES_MAP) {
   const propName = propertiesMap[item.property_id] || item.property_name || `Property #${item.property_id}`;
   const guestName = guest.name || (item.type === "ClosedPeriod" ? "Closed" : "");
 
+  const bookingId = String(item.id).replace('.0', '');
+  const note = (notesMap && notesMap.get(bookingId)) || (item.notes ? cleanNote(item.notes) : (item.note ? cleanNote(item.note) : ""));
+
   return {
-    booking_id: String(item.id).replace('.0', ''),
+    booking_id: bookingId,
     property_name: propName,
     people,
     guest_name: guestName,
@@ -372,13 +435,64 @@ function mapBooking(item, propertiesMap = PROPERTIES_MAP) {
     check_in_time: item.check_in?.time || "16:00:00",
     departure: item.departure ? item.departure.slice(0, 10) : "",
     check_out_time: item.check_out?.time || "11:00:00",
-    note: item.note ? cleanNote(item.note) : "",
+    note,
     detail_status: "DONE"
   };
 }
 
+// --- Új foglalási értesítések küldése (Golf del Sur -> Lymo.canari@gmail.com) ---
+const GOLF_DEL_SUR_NOTIFICATION_EMAIL = "Lymo.canari@gmail.com";
+
+function isGolfDelSurProperty(propName) {
+  if (!propName) return false;
+  const p = propName.trim().toLowerCase();
+  return p.includes("albatros") || p.includes("colibri") || p.includes("tucan");
+}
+
+async function getUnnotifiedGolfBookings(env, rows) {
+  if (!rows || !rows.length || !env.DB) return { unnotifiedBookings: [] };
+  try {
+    const golfRows = rows.filter(r => 
+      isGolfDelSurProperty(r.property_name) &&
+      r.guest_name &&
+      r.guest_name.trim().toLowerCase() !== "closed"
+    );
+
+    if (!golfRows.length) return { unnotifiedBookings: [] };
+
+    await env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS email_notifications (
+        booking_id TEXT PRIMARY KEY,
+        property_name TEXT,
+        guest_name TEXT,
+        check_in_date TEXT,
+        departure TEXT,
+        sent_at TEXT,
+        recipient TEXT,
+        status TEXT
+      )
+    `).run();
+
+    const notifiedResult = await env.DB.prepare(
+      "SELECT booking_id FROM email_notifications"
+    ).all();
+    const notifiedSet = new Set((notifiedResult.results || []).map(r => String(r.booking_id).replace('.0', '')));
+
+    const unnotifiedBookings = golfRows.filter(r => {
+      const id = String(r.booking_id).replace('.0', '');
+      return !notifiedSet.has(id);
+    });
+
+    return { unnotifiedBookings };
+  } catch (err) {
+    console.error("getUnnotifiedGolfBookings error:", err);
+    return { unnotifiedBookings: [] };
+  }
+}
+
 async function batchUpsertBookings(env, rows) {
   if (!rows.length) return;
+
   const sql = `
     INSERT INTO bookings (
       booking_id, property_name, people, guest_name, guest_phone,
@@ -454,6 +568,9 @@ function cleanNote(html) {
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
     .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
     .trim();
 }
 
