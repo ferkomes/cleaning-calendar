@@ -1973,7 +1973,7 @@ function renderMatrixForRegion(regionKey, containerId, propertiesList, startDay,
         const isEndClipped = b.endOffset > (startDay + count - 1);
         const radiusStyle = 'border-radius: ' + (isStartClipped ? '0' : '8px') + ' ' + (isEndClipped ? '0' : '8px') + ' ' + (isEndClipped ? '0' : '8px') + ' ' + (isStartClipped ? '0' : '8px') + ';';
 
-        rowsHtml += '<div class="booking-span-bar" style="grid-column: ' + colStart + ' / ' + colEnd + '; background: ' + prop.color + '; ' + radiusStyle + '" onclick="openBookingModal(\'' + b.id + '\')" title="' + b.guest + ' (' + b.people + ') - Részletekért kattints!">' +
+        rowsHtml += '<div class="booking-span-bar" data-bid="' + b.id + '" style="grid-column: ' + colStart + ' / ' + colEnd + '; background: ' + prop.color + '; ' + radiusStyle + '" onclick="openBookingModal(this.dataset.bid)" title="' + b.guest + ' (' + b.people + ') - Részletekért kattints!">' +
           '<span class="bar-title">' + b.guest + '</span>' +
           '<span class="bar-info">' + (b.people ? '(' + b.people + ')' : '') + '</span>' +
           (b.note ? '<span class="bar-note">👶 Kiságy</span>' : '') +
