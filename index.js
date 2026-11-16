@@ -1414,7 +1414,7 @@ h1 {
 
 .matrix-header-row {
   display: grid;
-  gap: 4px;
+  gap: 0;
   padding-bottom: 10px;
   border-bottom: 2px solid var(--line);
   margin-bottom: 12px;
@@ -1424,7 +1424,7 @@ h1 {
   font-size: 12px;
   font-weight: 700;
   color: var(--ink);
-  min-width: 48px;
+  width: 50px;
 }
 .matrix-day-cell small {
   display: block;
@@ -1443,14 +1443,35 @@ h1 {
 
 .matrix-apt-row {
   display: grid;
-  gap: 4px;
+  gap: 0;
   align-items: center;
-  padding: 8px 0;
+  padding: 6px 0;
   border-bottom: 1px solid var(--line);
   position: relative;
   min-height: 56px;
 }
 .matrix-apt-row:last-child { border-bottom: none; }
+
+.matrix-bg-track {
+  position: absolute;
+  left: 130px;
+  top: 6px;
+  bottom: 6px;
+  display: grid;
+  gap: 0;
+  pointer-events: none;
+}
+.matrix-bg-slot {
+  height: 44px;
+  background: var(--bg);
+  border-radius: 6px;
+  border: 1px dashed var(--line);
+  opacity: 0.6;
+}
+.matrix-bg-slot.is-today {
+  border: 1px solid #fca5a5;
+  background: #fef2f2;
+}
 
 .span-btn {
   border: 1px solid var(--line);
@@ -1473,7 +1494,8 @@ h1 {
   align-items: center;
   gap: 8px;
   padding-right: 6px;
-  z-index: 2;
+  z-index: 10;
+  background: var(--panel);
 }
 .matrix-apt-title .dot {
   width: 10px;
@@ -2049,24 +2071,21 @@ function renderMatrixForRegion(regionKey, containerId, propertiesList, startDay,
   propertiesList.forEach(prop => {
     const aptBookings = PROCESSED_BOOKINGS.filter(b => b.apt === prop.name);
 
-    rowsHtml += '<div class="matrix-apt-row" style="grid-template-columns: 130px repeat(' + (count * 2) + ', 25px);">' +
-      '<div class="matrix-apt-title">' +
-        '<span class="dot" style="background:' + prop.color + ';"></span>' +
-        '<span class="name">' + prop.name + '</span>' +
-      '</div>';
-
+    let bgSlotsHtml = '';
     days.forEach(dIdx => {
       const isToday = (dIdx === 0);
-      rowsHtml += '<div class="matrix-bg-slot' + (isToday ? ' is-today' : '') + '" style="grid-column: span 2;"></div>';
+      bgSlotsHtml += '<div class="matrix-bg-slot' + (isToday ? ' is-today' : '') + '" style="width:48px; margin:0 1px; height:44px;"></div>';
     });
+    const bgTrack = '<div class="matrix-bg-track" style="width:' + (count * 50) + 'px; grid-template-columns:repeat(' + count + ', 50px);">' + bgSlotsHtml + '</div>';
 
+    let barsHtml = '';
     aptBookings.forEach(b => {
       const minLine = 2;
       const maxLine = 2 + (count * 2);
 
-      // Érkezés: a bejelentkezés napjának DÉLI felezőpontjától indul (16h érkezés)
+      // Érkezés: mindig az első nap déli felezőpontjától indul (16h)
       const rawStart = 2 + (b.startOffset - startDay) * 2 + 1;
-      // Távozás: a kijelentkezés napjának DÉLI felezőpontjáig tart (11h távozás)
+      // Távozás: mindig az utolsó nap déli felezőpontjáig tart (11h)
       const rawEnd = 2 + (b.endOffset - startDay) * 2 + 1;
 
       const colStart = Math.max(minLine, rawStart);
@@ -2080,7 +2099,7 @@ function renderMatrixForRegion(regionKey, containerId, propertiesList, startDay,
         const rR = isEndClipped ? '0' : '6px';
         const radiusStyle = 'border-radius: ' + rL + ' ' + rR + ' ' + rR + ' ' + rL + ';';
 
-        rowsHtml += '<div class="booking-span-bar" data-bid="' + b.id + '" style="grid-column: ' + colStart + ' / ' + colEnd + '; background: ' + prop.color + '; ' + radiusStyle + '; margin: 0 1px;" onclick="openBookingModal(this.dataset.bid)" title="' + b.guest + ' (' + b.people + ') - Részletekért kattints!">' +
+        barsHtml += '<div class="booking-span-bar" data-bid="' + b.id + '" style="grid-row:1; grid-column: ' + colStart + ' / ' + colEnd + '; background: ' + prop.color + '; ' + radiusStyle + '; margin: 0 1px;" onclick="openBookingModal(this.dataset.bid)" title="' + b.guest + ' (' + b.people + ') - Részletekért kattints!">' +
           '<span class="bar-title">' + b.guest + '</span>' +
           '<span class="bar-info">' + (b.people ? '(' + b.people + ')' : '') + '</span>' +
           (b.note ? '<span class="bar-note">👶 Kiságy</span>' : '') +
@@ -2089,7 +2108,14 @@ function renderMatrixForRegion(regionKey, containerId, propertiesList, startDay,
       }
     });
 
-    rowsHtml += '</div>';
+    rowsHtml += '<div class="matrix-apt-row" style="grid-template-columns: 130px repeat(' + (count * 2) + ', 25px);">' +
+      bgTrack +
+      '<div class="matrix-apt-title" style="grid-column:1 / 2; grid-row:1;">' +
+        '<span class="dot" style="background:' + prop.color + ';"></span>' +
+        '<span class="name">' + prop.name + '</span>' +
+      '</div>' +
+      barsHtml +
+    '</div>';
   });
 
   container.innerHTML = headerHtml + rowsHtml;
