@@ -168,12 +168,18 @@ export default {
           }
           const { unnotifiedBookings } = await getUnnotifiedBookings(env, rows);
           await batchUpsertBookings(env, rows);
+
+          const periodStart = body.periodStart || new Date(Date.now() - 32 * 86400000).toISOString().slice(0, 10);
+          const validIds = rows.map(r => r.booking_id);
+          const prunedBookings = await pruneStaleBookings(env, validIds, periodStart);
+
           await markSyncDone(env);
           await logIssue(env, `✅ Sikeres szinkronizáció: ${rows.length} foglalás mentve (${auth.username}).`);
           return new Response(JSON.stringify({
             success: true,
             count: rows.length,
-            pendingNotifications: unnotifiedBookings
+            pendingNotifications: unnotifiedBookings,
+            prunedCount: prunedBookings ? prunedBookings.length : 0
           }), {
             status: 200,
             headers: { "Content-Type": "application/json" }
@@ -686,30 +692,89 @@ async function batchUpsertBookings(env, rows) {
 }
 
 async function pruneStaleBookings(env, validIds, periodStart) {
-  if (!validIds || !validIds.length) return;
+  if (!validIds || !validIds.length) return [];
   try {
     const existing = await env.DB.prepare(
-      "SELECT booking_id FROM bookings WHERE departure >= ?"
+      "SELECT * FROM bookings WHERE departure >= ?"
     ).bind(periodStart).all();
 
     const validSet = new Set(validIds.map(id => String(id).replace('.0', '')));
-    const idsToDelete = (existing.results || [])
-      .map(r => String(r.booking_id))
-      .filter(id => !validSet.has(id.replace('.0', '')));
+    const bookingsToDelete = (existing.results || [])
+      .filter(r => !validSet.has(String(r.booking_id).replace('.0', '')));
 
-    if (idsToDelete.length > 0) {
+    if (bookingsToDelete.length > 0) {
       const BATCH_SIZE = 25;
-      for (let i = 0; i < idsToDelete.length; i += BATCH_SIZE) {
-        const chunk = idsToDelete.slice(i, i + BATCH_SIZE);
-        const statements = chunk.map(id =>
-          env.DB.prepare("DELETE FROM bookings WHERE booking_id = ?").bind(id)
+      for (let i = 0; i < bookingsToDelete.length; i += BATCH_SIZE) {
+        const chunk = bookingsToDelete.slice(i, i + BATCH_SIZE);
+        const statements = chunk.map(b =>
+          env.DB.prepare("DELETE FROM bookings WHERE booking_id = ?").bind(String(b.booking_id).replace('.0', ''))
         );
         await env.DB.batch(statements);
       }
-      await logIssue(env, `🧹 Törölve ${idsToDelete.length} lemondott/stale foglalás.`);
+      await logIssue(env, `🧹 Törölve ${bookingsToDelete.length} lemondott/stale foglalás.`);
+
+      // WhatsApp értesítések küldése a törölt foglalásokról
+      await sendCancelledBookingWhatsAppNotifications(env, bookingsToDelete);
     }
+    return bookingsToDelete;
   } catch (err) {
     console.error("Prune error:", err);
+    return [];
+  }
+}
+
+async function sendCancelledBookingWhatsAppNotifications(env, cancelledBookings) {
+  if (!cancelledBookings || !cancelledBookings.length) return;
+
+  const todayIso = new Date().toISOString().slice(0, 10);
+
+  for (const b of cancelledBookings) {
+    const bId = String(b.booking_id).replace('.0', '');
+    // Csak a mai napon vagy a jövőben távozó/érkező lemondott foglalásokról küldünk értesítést
+    if (b.departure && b.departure < todayIso) continue;
+
+    const isGolf = isGolfDelSurProperty(b.property_name);
+    const isArena = isLaArenaProperty(b.property_name);
+    if (!isGolf && !isArena) continue;
+
+    const areaName = isArena ? "La Arena" : "Golf del Sur";
+    const recipients = [FERI_WHATSAPP];
+    if (isGolf) recipients.push(GOLF_DEL_SUR_CLEANER_WHATSAPP);
+    if (isArena) recipients.push(LA_ARENA_CLEANER_WHATSAPP);
+
+    const checkInFormatted = `${b.check_in_date || ''} (${b.check_in_time ? b.check_in_time.slice(0, 5) : '16:00'})`;
+    const checkOutFormatted = `${b.departure || ''} (${b.check_out_time ? b.check_out_time.slice(0, 5) : '11:00'})`;
+
+    const waMessageLines = [
+      `❌ *FOGLALÁS LEMONDVA / CANCELACIÓN (${areaName})*`,
+      ``,
+      `📍 *Apartamento / Apartman:* ${b.property_name}`,
+      `👤 *Huésped / Vendég:* ${b.guest_name || 'N/A'}`,
+      `👥 *Personas / Létszám:* ${b.people || 'N/A'}`,
+      `📅 *Llegada / Tervezett érkezés:* ${checkInFormatted}`,
+      `📅 *Salida / Tervezett távozás:* ${checkOutFormatted}`,
+      `🆔 *ID:* #${bId}`,
+      ``,
+      `⚠️ *A foglalás törölve a naptárból. Erre az időszakra nem szükséges takarítani!*`
+    ];
+    const waMessage = waMessageLines.join("\n");
+
+    for (const r of recipients) {
+      try {
+        await fetch(`${GREEN_API_URL}/waInstance${GREEN_API_ID_INSTANCE}/sendMessage/${GREEN_API_TOKEN}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chatId: r,
+            message: waMessage
+          })
+        });
+      } catch (err) {
+        console.error("WhatsApp cancellation notification error:", err);
+      }
+    }
+
+    await logIssue(env, `❌ WhatsApp lemondás értesítő elküldve: #${bId} (${b.property_name}, ${b.guest_name}) -> ${recipients.join(", ")}`);
   }
 }
 
@@ -1349,7 +1414,6 @@ h1 {
 
 .matrix-header-row {
   display: grid;
-  grid-template-columns: 130px repeat(14, 52px);
   gap: 4px;
   padding-bottom: 10px;
   border-bottom: 2px solid var(--line);
@@ -1360,6 +1424,7 @@ h1 {
   font-size: 12px;
   font-weight: 700;
   color: var(--ink);
+  min-width: 48px;
 }
 .matrix-day-cell small {
   display: block;
@@ -1378,7 +1443,6 @@ h1 {
 
 .matrix-apt-row {
   display: grid;
-  grid-template-columns: 130px repeat(14, 52px);
   gap: 4px;
   align-items: center;
   padding: 8px 0;
@@ -1387,6 +1451,22 @@ h1 {
   min-height: 56px;
 }
 .matrix-apt-row:last-child { border-bottom: none; }
+
+.span-btn {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--ink);
+  padding: 5px 9px;
+  border-radius: 8px;
+  font-weight: 700;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.span-btn[aria-pressed="true"] {
+  background: var(--ink);
+  color: var(--bg);
+}
 
 .matrix-apt-title {
   display: flex;
@@ -1642,12 +1722,18 @@ h1 {
 
     <div class="timeline-nav-bar">
       <div class="nav-date-title">
-        <span>📅</span> <span id="rangeLabel">14 napos folyamatos sávok</span>
+        <span>📅</span> <span id="rangeLabel">1 hónapos folyamatos naptár</span>
       </div>
       <div class="nav-buttons">
-        <button class="nav-btn" onclick="navigateDays(-7)" title="Vissza 7 napot">◀ -7 nap</button>
+        <div class="seg" role="group" aria-label="Időtartam" style="display:inline-flex; margin-right:4px;">
+          <button id="span14Btn" class="span-btn" onclick="changeTimelineSpan(14)">14 nap</button>
+          <button id="span30Btn" class="span-btn" aria-pressed="true" onclick="changeTimelineSpan(30)">1 hónap</button>
+        </div>
+        <button class="nav-btn" onclick="navigateDays(-30)" title="Vissza 1 hónapot">◀ 1 hó</button>
+        <button class="nav-btn" onclick="navigateDays(-7)" title="Vissza 7 napot">◀ 7 nap</button>
         <button class="nav-btn nav-btn-today" onclick="navigateToday()" title="Ugrás a mai napra">Ma</button>
         <button class="nav-btn" onclick="navigateDays(7)" title="Előre 7 napot">+7 nap ▶</button>
+        <button class="nav-btn" onclick="navigateDays(30)" title="Előre 1 hónapot">+1 hó ▶</button>
       </div>
     </div>
 
@@ -1740,7 +1826,7 @@ const BASE_TODAY = new Date();
 BASE_TODAY.setHours(0, 0, 0, 0);
 
 let timelineOffsetDays = 0;
-const TIMELINE_DAYS_COUNT = 14;
+let timelineDaysCount = 30; // Alapértelmezés: 1 teljes hónap (30 nap)
 
 const PROPERTIES_CONFIG = {
   golf: [
@@ -1919,14 +2005,24 @@ function updateKPIs() {
   document.getElementById('kpiNotes').textContent = notes;
 }
 
+function changeTimelineSpan(count) {
+  timelineDaysCount = count;
+  const b14 = document.getElementById('span14Btn');
+  const b30 = document.getElementById('span30Btn');
+  if (b14) b14.setAttribute('aria-pressed', count === 14 ? 'true' : 'false');
+  if (b30) b30.setAttribute('aria-pressed', count === 30 ? 'true' : 'false');
+  renderTimeline();
+}
+
 function renderTimeline() {
   const startDay = timelineOffsetDays;
-  const count = TIMELINE_DAYS_COUNT;
+  const count = timelineDaysCount;
   const endDay = startDay + count - 1;
 
   const sDate = getDayDate(startDay).toLocaleDateString('hu-HU', { month: 'short', day: 'numeric' });
   const eDate = getDayDate(endDay).toLocaleDateString('hu-HU', { month: 'short', day: 'numeric' });
-  document.getElementById('rangeLabel').textContent = sDate + ' – ' + eDate + ' (14 napos folyamatos sávok)';
+  const labelSuffix = count === 30 ? '1 hónapos folyamatos naptár' : count + ' napos naptár';
+  document.getElementById('rangeLabel').textContent = sDate + ' – ' + eDate + ' (' + labelSuffix + ')';
 
   renderMatrixForRegion('golf', 'golfMatrix', PROPERTIES_CONFIG.golf, startDay, count);
   renderMatrixForRegion('arena', 'arenaMatrix', PROPERTIES_CONFIG.arena, startDay, count);
@@ -1939,7 +2035,7 @@ function renderMatrixForRegion(regionKey, containerId, propertiesList, startDay,
   const days = [];
   for (let i = 0; i < count; i++) days.push(startDay + i);
 
-  let headerHtml = '<div class="matrix-header-row"><div style="font-size:12px; font-weight:800; color:var(--mute); padding-left:4px;">Apartman</div>';
+  let headerHtml = '<div class="matrix-header-row" style="grid-template-columns: 130px repeat(' + count + ', 50px);"><div style="font-size:12px; font-weight:800; color:var(--mute); padding-left:4px;">Apartman</div>';
   days.forEach(dIdx => {
     const dObj = getDayDate(dIdx);
     const isToday = (dIdx === 0);
@@ -1953,7 +2049,7 @@ function renderMatrixForRegion(regionKey, containerId, propertiesList, startDay,
   propertiesList.forEach(prop => {
     const aptBookings = PROCESSED_BOOKINGS.filter(b => b.apt === prop.name);
 
-    rowsHtml += '<div class="matrix-apt-row">' +
+    rowsHtml += '<div class="matrix-apt-row" style="grid-template-columns: 130px repeat(' + count + ', 50px);">' +
       '<div class="matrix-apt-title">' +
         '<span class="dot" style="background:' + prop.color + ';"></span>' +
         '<span class="name">' + prop.name + '</span>' +

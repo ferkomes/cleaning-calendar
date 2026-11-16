@@ -183,19 +183,22 @@ async function sync() {
     };
   });
 
-  console.log(`📤 Pushing ${rows.length} rows to Cloudflare Worker...`);
+  console.log(`📤 Pushing ${rows.length} rows to Cloudflare Worker (period: ${periodStart} to ${periodEnd})...`);
   const pushResp = await fetch(WORKER_SYNC_URL, {
     method: "POST",
     headers: {
       "Authorization": ADMIN_AUTH,
       "Content-Type": "application/json"
     },
-    body: JSON.stringify({ rows })
+    body: JSON.stringify({ rows, periodStart, periodEnd })
   });
 
   const pushResult = await pushResp.json();
   if (pushResp.ok && pushResult.success) {
     console.log(`🎉 SUCCESS! Updated ${pushResult.count} bookings in Cleaning Calendar.`);
+    if (pushResult.prunedCount > 0) {
+      console.log(`🧹 Sikeresen eltávolítva ${pushResult.prunedCount} lemondott/törölt foglalás.`);
+    }
 
     // Új foglalások értesítéseinek kiküldése (Email + WhatsApp)
     const pending = pushResult.pendingNotifications || [];
