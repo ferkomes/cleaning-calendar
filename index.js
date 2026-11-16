@@ -2,6 +2,15 @@
 let detailsStatus = "idle";
 // idle | processing | done | failed
 
+// --------------------- Green-API WhatsApp & Értesítési Beállítások ---------------------
+const GREEN_API_URL = "https://7107.api.greenapi.com";
+const GREEN_API_ID_INSTANCE = "710722802966";
+const GREEN_API_TOKEN = "51cbdb160011438ebdbf13cef9c18d99111f4e75f6234c5ca3";
+
+const FERI_WHATSAPP = "31629306180@c.us"; // Ferenc - kapja mindet (Golf del Sur + La Arena)
+const GOLF_DEL_SUR_CLEANER_WHATSAPP = "34660541568@c.us"; // Golf del Sur takarító (+34 660 54 15 68)
+const LA_ARENA_CLEANER_WHATSAPP = "36305757170@c.us"; // La Arena takarító (+36 30 575 7170)
+
 // --------------------- Authentication ---------------------
 function authenticateUser(request) {
   const authHeader = request.headers.get("Authorization");
@@ -212,6 +221,66 @@ export default {
         }
       }
 
+      // 2.2 Takarítás kész állapot rögzítése és WhatsApp értesítés küldése Feri számára
+      if ((action === "toggle-cleaned" || pathname === "/toggle-cleaned") && request.method === "POST") {
+        try {
+          const body = await request.json();
+          const { booking_id, is_done } = body;
+          const bId = String(booking_id).replace('.0', '');
+          const statusVal = is_done ? 'done' : 'pending';
+          const cleanedAt = is_done ? new Date().toISOString() : null;
+
+          await env.DB.prepare(`
+            UPDATE bookings
+            SET cleaned_status = ?, cleaned_at = ?
+            WHERE booking_id = ?
+          `).bind(statusVal, cleanedAt, bId).run();
+
+          const booking = await env.DB.prepare("SELECT * FROM bookings WHERE booking_id = ?").bind(bId).first();
+
+          if (is_done && booking) {
+            const nowMadrid = new Date().toLocaleString('hu-HU', { timeZone: 'Europe/Madrid', hour: '2-digit', minute: '2-digit' });
+            const isLaArena = isLaArenaProperty(booking.property_name);
+            const areaName = isLaArena ? "La Arena" : "Golf del Sur";
+
+            const waMsgLines = [
+              `✨ *TAKARÍTÁS ELVÉGEZVE!*`,
+              ``,
+              `📍 *Apartman:* ${booking.property_name} (${areaName})`,
+              `🧹 *Státusz:* A takarítás befejeződött, a lakás tiszta és fogadásra kész!`,
+              `👤 *Távozó vendég:* ${booking.guest_name || 'Vendég'}`,
+              booking.note ? `📝 *Kérés volt:* ${booking.note}` : null,
+              `⏰ *Befejezve:* ${nowMadrid} (${auth.username})`
+            ].filter(Boolean).join("\n");
+
+            try {
+              await fetch(`${GREEN_API_URL}/waInstance${GREEN_API_ID_INSTANCE}/sendMessage/${GREEN_API_TOKEN}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  chatId: FERI_WHATSAPP,
+                  message: waMsgLines
+                })
+              });
+              await logIssue(env, `💬 WhatsApp takarítás kész értesítő elküldve Ferencnek: #${bId} (${booking.property_name})`);
+            } catch (waErr) {
+              await logIssue(env, `WhatsApp takarítás küldés hiba: ${waErr.message}`);
+            }
+          }
+
+          return new Response(JSON.stringify({ success: true, booking_id: bId, status: statusVal }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
+        } catch (err) {
+          await logIssue(env, `Toggle cleaned error: ${err.message}`);
+          return new Response(JSON.stringify({ success: false, error: err.message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+      }
+
       // 3. Szerver oldali szinkronizáció (Fallback ha a kliens közvetlenül hívná)
       if (pathname === "/update" || action === "update") {
         const cooldown = await checkSyncCooldown(env);
@@ -394,9 +463,14 @@ async function updateAllBookings(env) {
   const mappedRows = validBookings.map(item => mapBooking(item, PROPERTIES_MAP, notesMap));
 
   if (mappedRows.length) {
+    const { unnotifiedBookings } = await getUnnotifiedBookings(env, mappedRows);
     await batchUpsertBookings(env, mappedRows);
     const validIds = mappedRows.map(r => r.booking_id);
     await pruneStaleBookings(env, validIds, periodStart);
+
+    if (unnotifiedBookings && unnotifiedBookings.length) {
+      await sendNewBookingWhatsAppNotifications(env, unnotifiedBookings);
+    }
   }
 
   await logIssue(env, `✅ Lodgify szinkronizáció sikeres: ${mappedRows.length} aktív foglalás és időszak frissítve.`);
@@ -496,6 +570,74 @@ async function getUnnotifiedBookings(env, rows) {
   } catch (err) {
     console.error("getUnnotifiedBookings error:", err);
     return { unnotifiedBookings: [] };
+  }
+}
+
+async function sendNewBookingWhatsAppNotifications(env, unnotifiedBookings) {
+  if (!unnotifiedBookings || !unnotifiedBookings.length) return;
+
+  for (const b of unnotifiedBookings) {
+    const bId = String(b.booking_id).replace('.0', '');
+    const isGolf = isGolfDelSurProperty(b.property_name);
+    const isArena = isLaArenaProperty(b.property_name);
+    if (!isGolf && !isArena) continue;
+
+    const areaName = isArena ? "La Arena" : "Golf del Sur";
+    const recipients = [FERI_WHATSAPP];
+    if (isGolf) recipients.push(GOLF_DEL_SUR_CLEANER_WHATSAPP);
+    if (isArena) recipients.push(LA_ARENA_CLEANER_WHATSAPP);
+
+    const checkInFormatted = `${b.check_in_date || ''} (${b.check_in_time ? b.check_in_time.slice(0, 5) : '16:00'})`;
+    const checkOutFormatted = `${b.departure || ''} (${b.check_out_time ? b.check_out_time.slice(0, 5) : '11:00'})`;
+
+    const waMessageLines = [
+      `🏨 *NUEVA RESERVA / ÚJ FOGLALÁS (${areaName})*`,
+      ``,
+      `📍 *Apartamento / Apartman:* ${b.property_name}`,
+      `👤 *Huésped / Vendég:* ${b.guest_name || 'N/A'}`,
+      `👥 *Personas / Létszám:* ${b.people || 'N/A'}`,
+      `📅 *Llegada / Érkezés:* ${checkInFormatted}`,
+      `📅 *Salida / Távozás:* ${checkOutFormatted}`,
+      `📞 *Teléfono:* ${b.guest_phone || 'N/A'}`,
+      `🔑 *Lockbox / Széf:* ${b.lockbox_code || '-'}`,
+      `📝 *Notas / Megjegyzés:* ${b.note || 'Nincs / Ninguna'}`,
+      ``,
+      `🆔 *ID:* #${bId}`
+    ];
+    const waMessage = waMessageLines.join("\n");
+
+    for (const r of recipients) {
+      try {
+        await fetch(`${GREEN_API_URL}/waInstance${GREEN_API_ID_INSTANCE}/sendMessage/${GREEN_API_TOKEN}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chatId: r,
+            message: waMessage
+          })
+        });
+      } catch (err) {
+        console.error("WhatsApp notification error:", err);
+      }
+    }
+
+    try {
+      await env.DB.prepare(`
+        INSERT INTO email_notifications (booking_id, property_name, guest_name, check_in_date, departure, sent_at, recipient, status)
+        VALUES (?, ?, ?, ?, ?, datetime('now'), ?, 'sent')
+        ON CONFLICT(booking_id) DO UPDATE SET sent_at = excluded.sent_at, status = 'sent'
+      `).bind(
+        bId,
+        b.property_name || '',
+        b.guest_name || '',
+        b.check_in_date || '',
+        b.departure || '',
+        recipients.join(",")
+      ).run();
+      await logIssue(env, `💬 WhatsApp értesítő elküldve új foglalásról: #${bId} (${b.property_name}) -> ${recipients.join(", ")}`);
+    } catch (dbErr) {
+      console.error("DB mark notification error:", dbErr);
+    }
   }
 }
 
@@ -699,468 +841,1388 @@ async function serveIcalFeed(env, properties, settingName, host) {
 async function serveTable(env, properties, title, authUser = null, host = "ferkomes.com") {
   let whereClause = "";
   let bindParams = [];
-  if (properties.length) {
+  if (properties && properties.length) {
     whereClause = `WHERE property_name IN (${properties.map((_, i) => `?${i + 1}`).join(",")})`;
     bindParams = properties;
   }
   const sql = `SELECT * FROM bookings ${whereClause} ORDER BY check_in_date ASC`;
-  const rows = await env.DB.prepare(sql).bind(...bindParams).all();
+  const rowsResult = await env.DB.prepare(sql).bind(...bindParams).all();
+  const rawBookings = rowsResult.results || [];
 
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const now = new Date();
-
-  const upcomingBookings = (rows.results || []).filter(r => new Date(r.check_in_date) >= today);
-  const earliestArrivalDate = upcomingBookings.length > 0 ? new Date(upcomingBookings[0].check_in_date) : null;
-
-  let nextArrivalIds = new Set();
-  if (earliestArrivalDate) {
-    nextArrivalIds = new Set(
-      upcomingBookings
-        .filter(r => new Date(r.check_in_date).toDateString() === earliestArrivalDate.toDateString())
-        .map(r => r.booking_id)
-    );
-  }
-
-  const columns = [
-    "booking_id", "property_name", "people", "guest_name", "guest_phone",
-    "lockbox_code", "check_in_date", "check_in_time", "departure", "check_out_time", "note", "detail_status"
-  ];
-
-  // Column Visibility Settings
-  const laArenaSettingsResult = await env.DB.prepare("SELECT value FROM settings WHERE name = 'La-Arena-Columns'").first();
-  const golfDelSurSettingsResult = await env.DB.prepare("SELECT value FROM settings WHERE name = 'Golf-del-Sur-Columns'").first();
-
-  let laArenaCols = columns;
-  let golfDelSurCols = columns;
-
-  if (laArenaSettingsResult && laArenaSettingsResult.value) {
-    try {
-      const parsed = JSON.parse(laArenaSettingsResult.value);
-      if (Array.isArray(parsed)) laArenaCols = parsed;
-    } catch (e) {}
-  }
-
-  if (golfDelSurSettingsResult && golfDelSurSettingsResult.value) {
-    try {
-      const parsed = JSON.parse(golfDelSurSettingsResult.value);
-      if (Array.isArray(parsed)) golfDelSurCols = parsed;
-    } catch (e) {}
-  }
-
-  let currentVisibleCols = columns;
-  if (title.includes("La-Arena") && laArenaCols.length) {
-    currentVisibleCols = laArenaCols;
-  } else if (title.includes("Golf-del-Sur") && golfDelSurCols.length) {
-    currentVisibleCols = golfDelSurCols;
-  }
-
-  const isAllBookings = title === "All Bookings";
   const isAdmin = authUser && authUser.role === "admin";
+  const userRole = authUser ? authUser.role : "guest";
 
-  // Last Sync status check
   const cooldownCheck = await checkSyncCooldown(env);
   let lastSyncText = "";
   if (cooldownCheck.lastSyncIso) {
     const d = new Date(cooldownCheck.lastSyncIso);
-    lastSyncText = `Utolsó szinkronizáció: ${d.toLocaleTimeString("hu-HU", { hour: '2-digit', minute: '2-digit' })}`;
+    lastSyncText = d.toLocaleTimeString("hu-HU", { timeZone: "Europe/Madrid", hour: '2-digit', minute: '2-digit' });
+  }
+
+  let defaultArea = "all";
+  if (properties && properties.length === 2) {
+    defaultArea = "arena";
+  } else if (properties && properties.length === 3) {
+    defaultArea = "golf";
   }
 
   let html = `<!DOCTYPE html>
 <html lang="hu">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>${title} - Takarítási Naptár</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root {
-    --primary: #2563eb;
-    --primary-hover: #1d4ed8;
-    --success: #059669;
-    --success-hover: #047857;
-    --bg-light: #f9fafb;
-    --border-color: #e5e7eb;
-    --text-main: #1f2937;
+:root {
+  box-sizing: border-box;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  --bg: #f4f6f3;
+  --panel: #ffffff;
+  --ink: #16231f;
+  --mute: #5b6b65;
+  --line: #dbe4df;
+  --out: #b8410a;
+  --outbg: #fdebdd;
+  --in: #0b6b5e;
+  --inbg: #dcf3ec;
+  --warn: #7a4b00;
+  --warnbg: #fff0c2;
+  --ok: #0b6b5e;
+  --focus: #2563eb;
+  --turnover-badge: #dc2626;
+  --turnover-bg: #fee2e2;
+  --radius: 12px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1714;
+    --panel: #16231f;
+    --ink: #e8f0ec;
+    --mute: #9bb0a8;
+    --line: #27382f;
+    --out: #ffa66b;
+    --outbg: #3a2415;
+    --in: #6fe0c8;
+    --inbg: #12342d;
+    --warn: #ffd773;
+    --warnbg: #3a3010;
+    --ok: #6fe0c8;
+    --focus: #8fb3ff;
+    --turnover-badge: #f87171;
+    --turnover-bg: #450a0a;
   }
-  * { box-sizing: border-box; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    margin: 0;
-    padding: 16px;
-    background: #fdfdfd;
-    color: var(--text-main);
-  }
-  .header-bar {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 12px;
-    margin-bottom: 16px;
-    padding-bottom: 12px;
-    border-bottom: 2px solid var(--border-color);
-  }
-  .header-title {
-    font-size: 22px;
-    font-weight: 700;
-    margin: 0;
-    color: #111827;
-  }
-  .user-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 14px;
-    background: #f3f4f6;
-    border: 1px solid #d1d5db;
-    border-radius: 9999px;
-    font-size: 13px;
-    color: #374151;
-    cursor: pointer;
-    transition: all 0.15s ease;
-    user-select: none;
-  }
-  .user-badge:hover {
-    background: #fee2e2;
-    border-color: #fca5a5;
-    color: #991b1b;
-  }
-  .logout-btn {
-    font-size: 11px;
-    background: #e5e7eb;
-    padding: 2px 8px;
-    border-radius: 9999px;
-    font-weight: 600;
-    transition: all 0.15s;
-  }
-  .user-badge:hover .logout-btn {
-    background: #ef4444;
-    color: white;
-  }
-  .toolbar {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-    margin-bottom: 16px;
-  }
-  .nav-btn {
-    padding: 8px 14px;
-    font-size: 13px;
-    font-weight: 500;
-    cursor: pointer;
-    border-radius: 6px;
-    border: 1px solid #d1d5db;
-    background: #ffffff;
-    color: #374151;
-    transition: all 0.15s ease;
-  }
-  .nav-btn:hover {
-    background: #f3f4f6;
-    border-color: #9ca3af;
-  }
-  .nav-active {
-    background: var(--primary) !important;
-    color: #ffffff !important;
-    border-color: var(--primary) !important;
-    box-shadow: 0 1px 2px rgba(37, 99, 235, 0.2);
-  }
-  .sync-btn {
-    background: var(--success) !important;
-    color: white !important;
-    border-color: var(--success) !important;
-    font-weight: 600;
-  }
-  .sync-btn:hover {
-    background: var(--success-hover) !important;
-  }
-  .sync-btn:disabled {
-    background: #9ca3af !important;
-    border-color: #9ca3af !important;
-    cursor: not-allowed;
-  }
-  .sync-meta {
-    font-size: 12px;
-    color: #6b7280;
-    margin-left: auto;
-  }
-  .container {
-    overflow-x: auto;
-    border: 1px solid var(--border-color);
-    border-radius: 8px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-  }
-  table {
-    border-collapse: collapse;
-    width: 100%;
-    font-size: 13px;
-  }
-  th, td {
-    border: 1px solid #e5e7eb;
-    padding: 8px 10px;
-    text-align: left;
-    white-space: nowrap;
-  }
-  th {
-    background: #f9fafb;
-    color: #374151;
-    font-weight: 600;
-    position: sticky;
-    top: 0;
-    z-index: 10;
-  }
-  tr:nth-child(even) { background: #fafafa; }
-  tr:hover { background: #f0fdf4; }
-  .green { background: #dcfce7 !important; font-weight: 600; }
-  .blue { background: #e0f2fe !important; }
-  .grey { background: #f3f4f6 !important; color: #9ca3af; }
-  #syncMsg {
-    position: fixed;
-    top: 16px;
-    right: 16px;
-    z-index: 9999;
-    background: #10b981;
-    color: #ffffff;
-    padding: 10px 18px;
-    border-radius: 8px;
-    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -1px rgba(0,0,0,0.06);
-    font-size: 13px;
-    font-weight: 600;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.3s ease;
-  }
-  @media(max-width: 640px) {
-    body { padding: 10px; }
-    th, td { font-size: 12px; padding: 6px; }
-    .header-title { font-size: 18px; }
-    .nav-btn { padding: 6px 10px; font-size: 12px; }
-  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #0e1714;
+  --panel: #16231f;
+  --ink: #e8f0ec;
+  --mute: #9bb0a8;
+  --line: #27382f;
+  --out: #ffa66b;
+  --outbg: #3a2415;
+  --in: #6fe0c8;
+  --inbg: #12342d;
+  --warn: #ffd773;
+  --warnbg: #3a3010;
+  --ok: #6fe0c8;
+  --focus: #8fb3ff;
+  --turnover-badge: #f87171;
+  --turnover-bg: #450a0a;
+}
+
+*, *::before, *::after { box-sizing: inherit; }
+html { scroll-padding-top: env(safe-area-inset-top, 0px); height: 100%; }
+body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.45 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px);
+  background: var(--bg);
+  z-index: 10;
+}
+
+h1, h2, h3, .time, .apt, .sum b, .seg button, .code, .timeline-apt-name, .nav-date-title {
+  font-family: "Bricolage Grotesque", system-ui, sans-serif;
+}
+
+main {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 16px 16px 60px;
+}
+
+header {
+  position: sticky;
+  top: env(safe-area-inset-top, 0px);
+  background: var(--bg);
+  z-index: 20;
+  padding: 6px 0 14px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 16px;
+}
+
+.top-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+h1 {
+  font-size: 24px;
+  line-height: 1.1;
+  margin: 0;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+}
+
+.sub {
+  color: var(--mute);
+  margin: 0;
+  font-size: 13px;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sync-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 12px;
+  font: 600 13px 'Plus Jakarta Sans', sans-serif;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.sync-btn:hover { background: var(--line); }
+.sync-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.user-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--mute);
+  cursor: pointer;
+}
+.user-badge:hover { background: var(--line); color: var(--ink); }
+
+/* KPI Summary Cards */
+.sum {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.sum div {
+  flex: 1 1 130px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 14px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+}
+.sum b {
+  display: block;
+  font: 800 24px/1 "Bricolage Grotesque", sans-serif;
+}
+.sum span {
+  color: var(--mute);
+  font-size: 13px;
+  font-weight: 500;
+}
+.sum .hot b { color: var(--out); }
+
+/* Controls */
+.tools {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.tools-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.tools input {
+  flex: 1 1 200px;
+  min-width: 0;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+  font-size: 14px;
+}
+.tools input:focus {
+  outline: none;
+  border-color: var(--focus);
+}
+
+.seg {
+  display: flex;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--panel);
+}
+.seg button {
+  border: 0;
+  background: none;
+  color: var(--mute);
+  padding: 8px 12px;
+  font: 600 13px "Bricolage Grotesque", sans-serif;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+.seg button[aria-pressed="true"] {
+  background: var(--ink);
+  color: var(--bg);
+  font-weight: 700;
+}
+
+/* NAPI LISTA NÉZET */
+.day {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 6px 16px;
+  margin-top: 24px;
+}
+.day > h2 {
+  font-size: 18px;
+  margin: 0;
+  padding-top: 8px;
+  line-height: 1.2;
+}
+.day > h2 small {
+  display: block;
+  font: 500 13px 'Plus Jakarta Sans', sans-serif;
+  color: var(--mute);
+}
+.day.today > h2 { color: var(--out); }
+
+.list {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 6px 80px 1fr auto;
+  gap: 0 14px;
+  align-items: center;
+  padding: 12px 14px 12px 0;
+  border-top: 1px solid var(--line);
+  transition: background 0.15s;
+}
+.row:first-child { border-top: 0; }
+.row:hover { background: rgba(0,0,0,0.015); }
+.bar { align-self: stretch; }
+
+.time {
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--ink);
+  letter-spacing: -0.5px;
+}
+
+.badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 99px;
+  margin-bottom: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.out .badge { background: var(--outbg); color: var(--out); }
+.in .badge { background: var(--inbg); color: var(--in); }
+
+.turnover-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--turnover-bg);
+  color: var(--turnover-badge);
+  font-size: 11px;
+  font-weight: 800;
+  padding: 2px 7px;
+  border-radius: 99px;
+  margin-left: 6px;
+  animation: pulse 2s infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+.apt {
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1.2;
+}
+.who {
+  color: var(--mute);
+  font-size: 14px;
+}
+
+.note {
+  display: inline-block;
+  margin-top: 6px;
+  background: var(--warnbg);
+  color: var(--warn);
+  font-weight: 700;
+  font-size: 13px;
+  padding: 3px 9px;
+  border-radius: 6px;
+}
+
+.act {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-end;
+}
+.code {
+  font: 700 16px ui-monospace, Menlo, Consolas, monospace;
+  letter-spacing: .12em;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--ink);
+  border-radius: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.code:hover { background: var(--line); }
+
+.chk {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  min-height: 30px;
+  user-select: none;
+}
+.chk input {
+  width: 20px;
+  height: 20px;
+  accent-color: var(--ok);
+  cursor: pointer;
+}
+
+.row.done .apt, .row.done .who {
+  text-decoration: line-through;
+  opacity: .5;
+}
+.row.done {
+  background: rgba(11, 107, 94, 0.04);
+}
+
+/* FOLYAMATOS SÁVOS NAPTÁR (TIMELINE) */
+.timeline-section {
+  display: none;
+  margin-top: 16px;
+}
+
+.timeline-nav-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 16px;
+  margin-bottom: 16px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+}
+.nav-date-title {
+  font-size: 18px;
+  font-weight: 800;
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.nav-buttons {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.nav-btn {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink);
+  padding: 6px 12px;
+  font: 700 13px "Bricolage Grotesque", sans-serif;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.nav-btn:hover { background: var(--line); }
+.nav-btn-today {
+  background: var(--ink);
+  color: var(--bg);
+  border-color: var(--ink);
+}
+
+.timeline-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+  margin-bottom: 22px;
+}
+.timeline-header {
+  padding: 12px 16px;
+  background: rgba(0,0,0,0.02);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.timeline-header h3 {
+  font-size: 17px;
+  font-weight: 800;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.timeline-header span {
+  font-size: 12px;
+  color: var(--mute);
+  font-weight: 600;
+}
+
+.timeline-scroll-wrap {
+  overflow-x: auto;
+  padding: 14px 12px 18px;
+  -webkit-overflow-scrolling: touch;
+}
+
+.timeline-matrix {
+  display: grid;
+  position: relative;
+  width: max-content;
+  min-width: 100%;
+}
+
+.matrix-header-row {
+  display: grid;
+  grid-template-columns: 130px repeat(14, 52px);
+  gap: 4px;
+  padding-bottom: 10px;
+  border-bottom: 2px solid var(--line);
+  margin-bottom: 12px;
+}
+.matrix-day-cell {
+  text-align: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink);
+}
+.matrix-day-cell small {
+  display: block;
+  font-size: 10px;
+  color: var(--mute);
+  font-weight: 500;
+}
+.matrix-day-cell.today {
+  color: var(--out);
+  font-weight: 800;
+}
+.matrix-day-cell.today small {
+  color: var(--out);
+  font-weight: 700;
+}
+
+.matrix-apt-row {
+  display: grid;
+  grid-template-columns: 130px repeat(14, 52px);
+  gap: 4px;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+  position: relative;
+  min-height: 56px;
+}
+.matrix-apt-row:last-child { border-bottom: none; }
+
+.matrix-apt-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-right: 6px;
+  z-index: 2;
+}
+.matrix-apt-title .dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.matrix-apt-title .name {
+  font-size: 14px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.matrix-bg-slot {
+  height: 44px;
+  background: var(--bg);
+  border-radius: 6px;
+  border: 1px dashed var(--line);
+  opacity: 0.6;
+}
+.matrix-bg-slot.is-today {
+  border: 1px solid #fca5a5;
+  background: #fef2f2;
+}
+
+/* FOLYAMATOS SÁVOK */
+.booking-span-bar {
+  grid-row: 1;
+  height: 38px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  color: white;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.12);
+  cursor: pointer;
+  z-index: 5;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  position: relative;
+}
+.booking-span-bar:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 8px rgba(0,0,0,0.18);
+  filter: brightness(1.05);
+}
+
+.booking-span-bar .bar-title {
+  font-family: "Bricolage Grotesque", sans-serif;
+  font-size: 13px;
+  font-weight: 700;
+  margin-right: 6px;
+}
+.booking-span-bar .bar-info {
+  font-size: 11px;
+  font-weight: 500;
+  opacity: 0.9;
+}
+.booking-span-bar .bar-note {
+  background: rgba(0,0,0,0.25);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  margin-left: 6px;
+  font-weight: 700;
+}
+
+.bar-turnover-edge {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 24px;
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(220, 38, 38, 0.8),
+    rgba(220, 38, 38, 0.8) 4px,
+    rgba(255, 255, 255, 0.3) 4px,
+    rgba(255, 255, 255, 0.3) 8px
+  );
+  border-radius: 0 8px 8px 0;
+}
+
+/* Toast Message */
+.toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%) translateY(100px);
+  background: #16231f;
+  color: #ffffff;
+  padding: 12px 20px;
+  border-radius: 12px;
+  font-size: 13px;
+  font-weight: 600;
+  box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+  opacity: 0;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  z-index: 9999;
+  max-width: 90%;
+  text-align: center;
+}
+.toast.show {
+  transform: translateX(-50%) translateY(0);
+  opacity: 1;
+}
+
+/* Modal Popup */
+.modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.5);
+  backdrop-filter: blur(2px);
+  z-index: 1000;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+.modal-box {
+  background: var(--panel);
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  padding: 20px;
+  max-width: 380px;
+  width: 100%;
+  box-shadow: 0 20px 30px rgba(0,0,0,0.25);
+  color: var(--ink);
+  animation: popIn 0.2s ease-out;
+}
+@keyframes popIn {
+  from { transform: scale(0.95); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+.modal-box h4 {
+  font-family: "Bricolage Grotesque", sans-serif;
+  font-size: 19px;
+  margin: 0 0 4px;
+  font-weight: 800;
+}
+
+@media (max-width: 640px) {
+  .day { grid-template-columns: 1fr; }
+  .day > h2 { padding-top: 0; display: flex; gap: 8px; align-items: baseline; }
+  .row { grid-template-columns: 5px 1fr auto; gap: 0 10px; }
+  .time { grid-column: 2; font-size: 18px; }
+  .row > .mid { grid-column: 2; }
+  .row > .act { grid-column: 3; grid-row: 1/3; }
+  .code { font-size: 15px; padding: 4px 8px; }
+  .sum div { flex: 1 1 110px; padding: 8px 10px; }
+  .sum b { font-size: 20px; }
+}
 </style>
 </head>
 <body>
 
-<div id="syncMsg"></div>
-
-<div class="header-bar">
-  <div style="display:flex; align-items:center; gap: 12px;">
-    <h1 class="header-title">${title}</h1>
-  </div>
-  ${authUser ? `
-  <div class="user-badge" onclick="logout()" title="Kattints ide a kijelentkezéshez">
-    <span>👤 <strong>${authUser.username}</strong></span>
-    <span class="logout-btn">🚪 Kilépés</span>
-  </div>
-  ` : ''}
-</div>
-
-<div class="toolbar">
-  ${isAdmin ? `
-    <button type="button" onclick="location.href='?view=all'" class="nav-btn ${title === 'All Bookings' ? 'nav-active' : ''}">Összes apartman</button>
-    <button type="button" onclick="location.href='?view=la-arena'" class="nav-btn ${title.includes('La-Arena') ? 'nav-active' : ''}">La-Arena (Kata)</button>
-    <button type="button" onclick="location.href='?view=golf-del-sur'" class="nav-btn ${title.includes('Golf-del-Sur') ? 'nav-active' : ''}">Golf-del-Sur (Gábor)</button>
-    <button type="button" onclick="location.href='?view=logs'" class="nav-btn">Rendszernaplók (Logs)</button>
-  ` : ''}
-  <button type="button" id="updateBtn" onclick="updateTable()" class="nav-btn sync-btn">🔄 Frissítés (Sync)</button>
-  ${lastSyncText ? `<span class="sync-meta">${lastSyncText}</span>` : ''}
-</div>
-`;
-
-  // --- Admin iCal Feed és Oszlop Láthatóság Panel ---
-  if (isAdmin && title === "All Bookings") {
-    html += `
-<div style="background:#f0f9ff; padding:14px; border-radius:8px; margin-bottom:16px; border:1px solid #bae6fd;">
-  <h3 style="margin-top:0; font-size:15px; color:#0369a1;">📅 iCal Naptár Feed Linkek (Automatikus szinkronizációhoz)</h3>
-  <p style="font-size:13px; color:#0c4a6e; margin-bottom:8px;">Másold ki az alábbi linkeket a Google Naptárba, Outlookba vagy Apple Calendarba történő beillesztéshez:</p>
-  <div style="margin-bottom:8px;">
-    <strong style="font-size:13px;">La-Arena iCal:</strong>
-    <code id="laArenaIcal" style="display:block; background:#fff; padding:6px 10px; border:1px solid #cbd5e1; border-radius:4px; font-size:12px; margin-top:4px; word-break:break-all;">https://${host}/la-arena-ical</code>
-  </div>
-  <div>
-    <strong style="font-size:13px;">Golf-del-Sur iCal:</strong>
-    <code id="golfIcal" style="display:block; background:#fff; padding:6px 10px; border:1px solid #cbd5e1; border-radius:4px; font-size:12px; margin-top:4px; word-break:break-all;">https://${host}/golf-del-sur-ical</code>
-  </div>
-</div>
-
-<details style="margin-bottom:16px; background:#fafafa; border:1px solid #e5e7eb; border-radius:8px; padding:12px;">
-  <summary style="font-weight:600; cursor:pointer; font-size:14px; color:#374151;">⚙️ Oszlop Láthatóság Beállítása (Kata és Gábor nézeteihez)</summary>
-  <div style="display:flex; gap:20px; flex-wrap:wrap; margin-top:12px;">
-    <div style="flex:1; min-width:260px; padding:12px; background:#fff; border:1px solid #e5e7eb; border-radius:6px;">
-      <h4 style="margin-top:0; font-size:14px;">La-Arena Oszlopok</h4>
-      <form id="laArenaForm">
-        <input type="hidden" name="name" value="La-Arena-Columns">
-        ${columns.map(c => `
-          <div style="margin-bottom:4px; font-size:13px;">
-            <label style="cursor:pointer;">
-              <input type="checkbox" name="column" value="${c}" ${laArenaCols.includes(c) ? 'checked' : ''}>
-              ${c}
-            </label>
-          </div>
-        `).join('')}
-        <button type="button" onclick="saveSettings('laArenaForm')" class="nav-btn" style="margin-top:8px; background:#2563eb; color:white; border-color:#2563eb;">Mentés (La-Arena)</button>
-      </form>
+<main>
+  <header>
+    <div class="top-bar">
+      <div>
+        <h1>${title}</h1>
+        <p class="sub">Takarítási Naptár ${lastSyncText ? `• Frissítve: ${lastSyncText}` : ''}</p>
+      </div>
+      <div class="header-actions">
+        ${isAdmin ? `
+        <button class="sync-btn" id="syncBtn" onclick="triggerSync()">
+          <span id="syncIcon">🔄</span> <span id="syncText">Frissítés</span>
+        </button>
+        ` : ''}
+        ${authUser ? `
+        <div class="user-badge" onclick="logout()" title="Kijelentkezés">
+          <span>👤 <strong>${authUser.username}</strong></span>
+          <span style="font-size:10px; background:var(--line); padding:2px 6px; border-radius:4px;">Kilépés</span>
+        </div>
+        ` : ''}
+      </div>
     </div>
 
-    <div style="flex:1; min-width:260px; padding:12px; background:#fff; border:1px solid #e5e7eb; border-radius:6px;">
-      <h4 style="margin-top:0; font-size:14px;">Golf-del-Sur Oszlopok</h4>
-      <form id="golfForm">
-        <input type="hidden" name="name" value="Golf-del-Sur-Columns">
-        ${columns.map(c => `
-          <div style="margin-bottom:4px; font-size:13px;">
-            <label style="cursor:pointer;">
-              <input type="checkbox" name="column" value="${c}" ${golfDelSurCols.includes(c) ? 'checked' : ''}>
-              ${c}
-            </label>
-          </div>
-        `).join('')}
-        <button type="button" onclick="saveSettings('golfForm')" class="nav-btn" style="margin-top:8px; background:#2563eb; color:white; border-color:#2563eb;">Mentés (Golf-del-Sur)</button>
-      </form>
+    ${isAdmin ? `
+    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;">
+      <button type="button" onclick="location.href='?view=all'" class="nav-btn ${title === 'All Bookings' ? 'nav-btn-today' : ''}">Összes apartman</button>
+      <button type="button" onclick="location.href='?view=la-arena'" class="nav-btn ${title.includes('La-Arena') ? 'nav-btn-today' : ''}">La-Arena (Kata)</button>
+      <button type="button" onclick="location.href='?view=golf-del-sur'" class="nav-btn ${title.includes('Golf-del-Sur') ? 'nav-btn-today' : ''}">Golf-del-Sur (Gábor)</button>
+      <button type="button" onclick="location.href='?view=logs'" class="nav-btn">Rendszernaplók</button>
+      <button type="button" onclick="openIcalModal()" class="nav-btn" style="color:var(--focus);">📅 iCal Linkek</button>
+    </div>
+    ` : ''}
+
+    <!-- KPI SUMMARIES -->
+    <div class="sum" id="sum">
+      <div class="hot">
+        <b id="kpiToday">0</b>
+        <span>takarítás vár ma</span>
+      </div>
+      <div>
+        <b id="kpiWeek">0</b>
+        <span>feladat 7 napon belül</span>
+      </div>
+      <div>
+        <b id="kpiNotes">0</b>
+        <span>különleges kérés (kiságy)</span>
+      </div>
+    </div>
+
+    <!-- CONTROLS -->
+    <div class="tools">
+      <div class="tools-row">
+        <input id="q" type="search" placeholder="Keresés apartmanra, vendégre, kódra, babaágyra…" aria-label="Keresés">
+        
+        <!-- Nézet váltó (Lista vs Naptár) -->
+        <div class="seg" role="group" aria-label="Nézet">
+          <button id="viewListBtn" aria-pressed="true" onclick="switchView('list')">📋 Lista</button>
+          <button id="viewTimelineBtn" aria-pressed="false" onclick="switchView('timeline')">📆 Naptár (3 / 2 sor)</button>
+        </div>
+      </div>
+
+      <div class="tools-row" style="justify-content:space-between;">
+        <!-- Terület választó (csak ha Admin nézi az összeset) -->
+        ${!properties || !properties.length ? `
+        <div class="seg" id="areaFilterContainer" role="group" aria-label="Terület">
+          <button class="area-btn" data-a="all" aria-pressed="true" onclick="filterArea('all')">Összes</button>
+          <button class="area-btn" data-a="golf" aria-pressed="false" onclick="filterArea('golf')">⛳ Golf del Sur</button>
+          <button class="area-btn" data-a="arena" aria-pressed="false" onclick="filterArea('arena')">🏖️ La Arena</button>
+        </div>
+        ` : ''}
+
+        <!-- Művelet szűrő (csak lista nézetben látszik) -->
+        <div class="seg" id="typeFilters" role="group" aria-label="Szűrés">
+          <button class="type-btn" data-f="all" aria-pressed="true" onclick="filterType('all')">Mind</button>
+          <button class="type-btn" data-f="out" aria-pressed="false" onclick="filterType('out')">Takarítás (11h)</button>
+          <button class="type-btn" data-f="in" aria-pressed="false" onclick="filterType('in')">Érkezés (16h)</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- 1. NAPI LISTA NÉZET -->
+  <div id="listView"></div>
+
+  <!-- 2. FOLYAMATOS SÁVOS NAPTÁR NÉZET (3 ÉS 2 SOR) -->
+  <div id="timelineView" class="timeline-section">
+
+    <div class="timeline-nav-bar">
+      <div class="nav-date-title">
+        <span>📅</span> <span id="rangeLabel">14 napos folyamatos sávok</span>
+      </div>
+      <div class="nav-buttons">
+        <button class="nav-btn" onclick="navigateDays(-7)" title="Vissza 7 napot">◀ -7 nap</button>
+        <button class="nav-btn nav-btn-today" onclick="navigateToday()" title="Ugrás a mai napra">Ma</button>
+        <button class="nav-btn" onclick="navigateDays(7)" title="Előre 7 napot">+7 nap ▶</button>
+      </div>
+    </div>
+
+    <!-- GOLF DEL SUR (3 SOR) -->
+    <div class="timeline-card" id="golfTimelineCard">
+      <div class="timeline-header">
+        <h3>⛳ Golf del Sur <span>(3 soros idővonal)</span></h3>
+        <span>The Albatros, The Colibri, The Tucan</span>
+      </div>
+      <div class="timeline-scroll-wrap">
+        <div class="timeline-matrix" id="golfMatrix"></div>
+      </div>
+    </div>
+
+    <!-- LA ARENA (2 SOR) -->
+    <div class="timeline-card" id="arenaTimelineCard">
+      <div class="timeline-header">
+        <h3>🏖️ La Arena <span>(2 soros idővonal)</span></h3>
+        <span>The Banana, The Pirate</span>
+      </div>
+      <div class="timeline-scroll-wrap">
+        <div class="timeline-matrix" id="arenaMatrix"></div>
+      </div>
+    </div>
+
+  </div>
+
+</main>
+
+<!-- MODAL POPUP (FOGLALÁSI RÉSZLETEKHEZ) -->
+<div class="modal-overlay" id="bookingModal" onclick="closeModal(event)">
+  <div class="modal-box" onclick="event.stopPropagation()">
+    <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:10px;">
+      <h4 id="mPropName">Apartman</h4>
+      <span id="mDateSpan" style="font-size:12px; font-weight:700; color:var(--mute);">Dátumok</span>
+    </div>
+    <div style="font-size:15px; font-weight:700; margin-bottom:4px;" id="mGuestName">Vendég</div>
+    <div style="font-size:13px; color:var(--mute); margin-bottom:12px;" id="mGuestPeople">Létszám</div>
+
+    <div style="background:var(--bg); padding:10px 12px; border-radius:8px; border:1px solid var(--line); margin-bottom:12px; font-size:13px;">
+      <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+        <span>🚪 Check-Out:</span> <strong id="mCheckout">11:00</strong>
+      </div>
+      <div style="display:flex; justify-content:space-between;">
+        <span>🧳 Check-In:</span> <strong id="mCheckin">16:00</strong>
+      </div>
+    </div>
+
+    <div id="mNoteBox" style="display:none; background:var(--warnbg); color:var(--warn); padding:8px 10px; border-radius:8px; font-size:13px; font-weight:700; margin-bottom:12px;">
+      👶 <span id="mNoteText">Megjegyzés</span>
+    </div>
+
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-top:14px; border-top:1px solid var(--line); padding-top:12px;">
+      <div style="display:flex; align-items:center; gap:6px;">
+        <span style="font-size:13px; font-weight:700;">Széf:</span>
+        <button class="code" id="mCodeBtn" onclick="copyModalCode()">-</button>
+      </div>
+      <button class="nav-btn" onclick="document.getElementById('bookingModal').style.display='none'">Bezárás</button>
     </div>
   </div>
-</details>
-`;
-  }
+</div>
 
-  // --- Táblázat Fejléc és Tartalom ---
-  const headerHtml = columns.map(c => {
-    const isHidden = !isAllBookings && !currentVisibleCols.includes(c);
-    const style = isHidden ? 'style="display:none;"' : '';
-    const checkbox = isAllBookings ? `<input type="checkbox" ${currentVisibleCols.includes(c) ? 'checked' : ''} onchange="toggleColumn(event,'${c}')" style="margin-right:6px;">` : '';
-    return `<th ${style}>${checkbox}${c}</th>`;
-  }).join("");
+<!-- ICAL MODAL (ADMIN) -->
+<div class="modal-overlay" id="icalModal" onclick="this.style.display='none'">
+  <div class="modal-box" onclick="event.stopPropagation()" style="max-width:440px;">
+    <h4 style="margin-bottom:12px;">📅 iCal Naptár Linkek</h4>
+    <p style="font-size:13px; color:var(--mute); margin-bottom:12px;">Másold be a linket Google Naptárba vagy Apple Calendarba az automatikus szinkronhoz:</p>
+    <div style="margin-bottom:10px;">
+      <span style="font-size:12px; font-weight:700;">⛳ Golf del Sur iCal:</span>
+      <div class="code" style="font-size:12px; word-break:break-all; margin-top:4px;" onclick="copyDirectText('https://${host}/golf-del-sur-ical')">https://${host}/golf-del-sur-ical</div>
+    </div>
+    <div style="margin-bottom:14px;">
+      <span style="font-size:12px; font-weight:700;">🏖️ La Arena iCal:</span>
+      <div class="code" style="font-size:12px; word-break:break-all; margin-top:4px;" onclick="copyDirectText('https://${host}/la-arena-ical')">https://${host}/la-arena-ical</div>
+    </div>
+    <button class="nav-btn" style="width:100%;" onclick="document.getElementById('icalModal').style.display='none'">Bezárás</button>
+  </div>
+</div>
 
-  html += `<div class="container"><table id="bookingTable"><thead><tr>${headerHtml}</tr></thead><tbody>`;
-
-  for (const row of (rows.results || [])) {
-    const arrival = new Date(row.check_in_date);
-    const departure = new Date(row.departure);
-    arrival.setHours(0, 0, 0, 0);
-    departure.setHours(0, 0, 0, 0);
-
-    let cls = "";
-    if (nextArrivalIds.has(row.booking_id)) {
-      cls = "green";
-    } else if (arrival <= now && departure >= now) {
-      cls = "blue";
-    } else if (arrival < today) {
-      cls = "grey";
-    }
-
-    html += `<tr class="${cls}">` + columns.map(c => {
-      const isHidden = !isAllBookings && !currentVisibleCols.includes(c);
-      const style = isHidden ? 'style="display:none;"' : '';
-      return `<td ${style}>${row[c] || ""}</td>`;
-    }).join("") + `</tr>`;
-  }
-
-  html += `</tbody></table></div>
+<!-- TOAST MESSAGE -->
+<div id="toast" class="toast">Kész!</div>
 
 <script>
-window.onload = function() {
-  const greenRow = document.querySelector("tr.green");
-  if (greenRow) greenRow.scrollIntoView({ behavior: "smooth", block: "center" });
+const RAW_BOOKINGS = ${JSON.stringify(rawBookings)};
+const ALLOWED_PROPERTIES = ${JSON.stringify(properties || [])};
+const CURRENT_USER = ${JSON.stringify({ username: authUser ? authUser.username : 'Vendég', role: userRole, isAdmin })};
+const DEFAULT_AREA = "${defaultArea}";
 
-  // Update iCal URLs with current origin
-  const origin = window.location.origin;
-  const laEl = document.getElementById("laArenaIcal");
-  const golfEl = document.getElementById("golfIcal");
-  if (laEl) laEl.textContent = origin + "/la-arena-ical";
-  if (golfEl) golfEl.textContent = origin + "/golf-del-sur-ical";
+const BASE_TODAY = new Date();
+BASE_TODAY.setHours(0, 0, 0, 0);
+
+let timelineOffsetDays = 0;
+const TIMELINE_DAYS_COUNT = 14;
+
+const PROPERTIES_CONFIG = {
+  golf: [
+    { name: 'The Albatros', color: '#4f46e5', icon: '🦅' },
+    { name: 'The Colibri', color: '#0284c7', icon: '🐦' },
+    { name: 'The Tucan', color: '#16a34a', icon: '🦜' }
+  ],
+  arena: [
+    { name: 'The Banana', color: '#d97706', icon: '🍌' },
+    { name: 'The Pirate', color: '#7c3aed', icon: '🏴‍☠️' }
+  ]
 };
 
-// Kijelentkezés
+let currentType = 'all';
+let currentArea = DEFAULT_AREA;
+let currentView = 'list';
+let searchQuery = '';
+
+if (ALLOWED_PROPERTIES.length > 0) {
+  const areaFilterEl = document.getElementById('areaFilterContainer');
+  if (areaFilterEl) areaFilterEl.style.display = 'none';
+}
+
+function parseDateToDays(isoStr) {
+  if (!isoStr) return 0;
+  const d = new Date(isoStr.slice(0, 10));
+  d.setHours(0, 0, 0, 0);
+  const diffTime = d.getTime() - BASE_TODAY.getTime();
+  return Math.round(diffTime / (1000 * 60 * 60 * 24));
+}
+
+function getDayDate(n) {
+  const d = new Date(BASE_TODAY);
+  d.setDate(d.getDate() + n);
+  return d;
+}
+
+const PROCESSED_BOOKINGS = (RAW_BOOKINGS || []).map(b => {
+  const startOffset = parseDateToDays(b.check_in_date);
+  const endOffset = parseDateToDays(b.departure);
+  const pName = b.property_name || '';
+  const isArena = pName.includes('Banana') || pName.includes('Pirate');
+  const area = isArena ? 'arena' : 'golf';
+
+  return {
+    id: String(b.booking_id).replace('.0', ''),
+    apt: pName,
+    area: area,
+    guest: b.guest_name || 'Vendég',
+    people: b.people || '',
+    phone: b.guest_phone || '',
+    lockbox: b.lockbox_code || '-',
+    startOffset: startOffset,
+    endOffset: endOffset,
+    startDateStr: b.check_in_date,
+    endDateStr: b.departure,
+    checkInTime: b.check_in_time ? b.check_in_time.slice(0, 5) : '16:00',
+    checkOutTime: b.check_out_time ? b.check_out_time.slice(0, 5) : '11:00',
+    note: b.note || '',
+    cleanedStatus: b.cleaned_status || 'pending',
+    isTurnoverOut: false,
+    isTurnoverIn: false
+  };
+});
+
+PROCESSED_BOOKINGS.forEach(b1 => {
+  const sameDayNext = PROCESSED_BOOKINGS.find(b2 => b2.apt === b1.apt && b2.startOffset === b1.endOffset && b2.id !== b1.id);
+  if (sameDayNext) {
+    b1.isTurnoverOut = true;
+    sameDayNext.isTurnoverIn = true;
+  }
+});
+
+function renderList() {
+  const s = searchQuery.toLowerCase().trim();
+  const events = [];
+
+  PROCESSED_BOOKINGS.forEach(b => {
+    events.push({
+      eventId: b.id + '_out',
+      bookingId: b.id,
+      d: b.endOffset,
+      t: 'out',
+      time: b.checkOutTime,
+      apt: b.apt,
+      area: b.area,
+      guest: b.guest,
+      people: b.people,
+      lockbox: b.lockbox,
+      note: b.note,
+      turnover: b.isTurnoverOut,
+      isCleaned: b.cleanedStatus === 'done'
+    });
+
+    events.push({
+      eventId: b.id + '_in',
+      bookingId: b.id,
+      d: b.startOffset,
+      t: 'in',
+      time: b.checkInTime,
+      apt: b.apt,
+      area: b.area,
+      guest: b.guest,
+      people: b.people,
+      lockbox: b.lockbox,
+      note: b.note,
+      turnover: b.isTurnoverIn,
+      isCleaned: b.cleanedStatus === 'done'
+    });
+  });
+
+  const filtered = events.filter(e => {
+    const matchType = (currentType === 'all') || (e.t === currentType);
+    const matchArea = (currentArea === 'all') || (e.area === currentArea);
+    const matchSearch = !s || (e.apt + e.guest + e.lockbox + (e.note || '')).toLowerCase().includes(s);
+    const matchRange = e.d >= -1 && e.d <= 60;
+    return matchType && matchArea && matchSearch && matchRange;
+  });
+
+  const days = [...new Set(filtered.map(e => e.d))].sort((a, b) => a - b);
+  const container = document.getElementById('listView');
+
+  if (!days.length) {
+    container.innerHTML = '<p style="text-align:center; padding:40px 10px; color:var(--mute);">Nincs megjeleníthető foglalás a kiválasztott szűrőkkel.</p>';
+    updateKPIs();
+    return;
+  }
+
+  container.innerHTML = days.map(n => {
+    const dObj = getDayDate(n);
+    const dayName = n === 0 ? 'Ma' : n === 1 ? 'Holnap' : n === -1 ? 'Tegnap' : dObj.toLocaleDateString('hu-HU', { weekday: 'long' });
+    const fullDate = dObj.toLocaleDateString('hu-HU', { month: 'long', day: 'numeric' });
+
+    let rowsHtml = filtered.filter(e => e.d === n).map(e => {
+      const allProps = [...PROPERTIES_CONFIG.golf, ...PROPERTIES_CONFIG.arena];
+      const propInfo = allProps.find(p => p.name === e.apt) || { color: '#64748b' };
+      return '<div class="row ' + e.t + (e.isCleaned ? ' done' : '') + '">' +
+        '<span class="bar" style="background:' + propInfo.color + '"></span>' +
+        '<div class="time">' + e.time + '</div>' +
+        '<div class="mid">' +
+          '<div>' +
+            '<span class="badge">' + (e.t === 'out' ? 'Takarítás' : 'Érkezés') + '</span>' +
+            (e.turnover ? '<span class="turnover-pill">⚡ Turnover</span>' : '') +
+          '</div>' +
+          '<div class="apt">' + e.apt + '</div>' +
+          '<div class="who">' + e.guest + (e.people ? ', ' + e.people : '') + '</div>' +
+          (e.note ? '<div class="note">👶 ' + e.note + '</div>' : '') +
+        '</div>' +
+        '<div class="act">' +
+          '<button class="code" data-k="' + e.lockbox + '" title="Széfkód másolása">' + e.lockbox + '</button>' +
+          '<label class="chk">' +
+            '<input type="checkbox" data-bid="' + e.bookingId + '" data-apt="' + e.apt + '" ' + (e.isCleaned ? 'checked' : '') + ' onchange="handleCleanToggle(this)">' +
+            'Kész' +
+          '</label>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+
+    return '<section class="day' + (n === 0 ? ' today' : '') + '">' +
+      '<h2>' + dayName + '<small>' + fullDate + '</small></h2>' +
+      '<div class="list">' + rowsHtml + '</div>' +
+    '</section>';
+  }).join('');
+
+  updateKPIs();
+}
+
+function updateKPIs() {
+  const activeBookings = PROCESSED_BOOKINGS.filter(b => (currentArea === 'all') || (b.area === currentArea));
+  const todo = activeBookings.filter(b => b.endOffset === 0 && b.cleanedStatus !== 'done').length;
+  const week = activeBookings.filter(b => (b.startOffset >= 0 && b.startOffset <= 6) || (b.endOffset >= 0 && b.endOffset <= 6)).length;
+  const notes = activeBookings.filter(b => b.note && ((b.startOffset >= 0 && b.startOffset <= 6) || (b.endOffset >= 0 && b.endOffset <= 6))).length;
+
+  document.getElementById('kpiToday').textContent = todo;
+  document.getElementById('kpiWeek').textContent = week;
+  document.getElementById('kpiNotes').textContent = notes;
+}
+
+function renderTimeline() {
+  const startDay = timelineOffsetDays;
+  const count = TIMELINE_DAYS_COUNT;
+  const endDay = startDay + count - 1;
+
+  const sDate = getDayDate(startDay).toLocaleDateString('hu-HU', { month: 'short', day: 'numeric' });
+  const eDate = getDayDate(endDay).toLocaleDateString('hu-HU', { month: 'short', day: 'numeric' });
+  document.getElementById('rangeLabel').textContent = sDate + ' – ' + eDate + ' (14 napos folyamatos sávok)';
+
+  renderMatrixForRegion('golf', 'golfMatrix', PROPERTIES_CONFIG.golf, startDay, count);
+  renderMatrixForRegion('arena', 'arenaMatrix', PROPERTIES_CONFIG.arena, startDay, count);
+}
+
+function renderMatrixForRegion(regionKey, containerId, propertiesList, startDay, count) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+
+  const days = [];
+  for (let i = 0; i < count; i++) days.push(startDay + i);
+
+  let headerHtml = '<div class="matrix-header-row"><div style="font-size:12px; font-weight:800; color:var(--mute); padding-left:4px;">Apartman</div>';
+  days.forEach(dIdx => {
+    const dObj = getDayDate(dIdx);
+    const isToday = (dIdx === 0);
+    const dayShort = dIdx === 0 ? 'Ma' : dObj.toLocaleDateString('hu-HU', { weekday: 'short' });
+    const dateNum = dObj.getDate();
+    headerHtml += '<div class="matrix-day-cell' + (isToday ? ' today' : '') + '">' + dayShort + '<small>' + dateNum + '.</small></div>';
+  });
+  headerHtml += '</div>';
+
+  let rowsHtml = '';
+  propertiesList.forEach(prop => {
+    const aptBookings = PROCESSED_BOOKINGS.filter(b => b.apt === prop.name);
+
+    rowsHtml += '<div class="matrix-apt-row">' +
+      '<div class="matrix-apt-title">' +
+        '<span class="dot" style="background:' + prop.color + ';"></span>' +
+        '<span class="name">' + prop.name + '</span>' +
+      '</div>';
+
+    days.forEach(dIdx => {
+      const isToday = (dIdx === 0);
+      rowsHtml += '<div class="matrix-bg-slot' + (isToday ? ' is-today' : '') + '"></div>';
+    });
+
+    aptBookings.forEach(b => {
+      if (b.endOffset >= startDay && b.startOffset <= (startDay + count - 1)) {
+        const colStart = Math.max(1, b.startOffset - startDay + 1) + 1;
+        const colEnd = Math.min(count, b.endOffset - startDay + 1) + 2;
+
+        const isStartClipped = b.startOffset < startDay;
+        const isEndClipped = b.endOffset > (startDay + count - 1);
+        const radiusStyle = 'border-radius: ' + (isStartClipped ? '0' : '8px') + ' ' + (isEndClipped ? '0' : '8px') + ' ' + (isEndClipped ? '0' : '8px') + ' ' + (isStartClipped ? '0' : '8px') + ';';
+
+        rowsHtml += '<div class="booking-span-bar" style="grid-column: ' + colStart + ' / ' + colEnd + '; background: ' + prop.color + '; ' + radiusStyle + '" onclick="openBookingModal(\'' + b.id + '\')" title="' + b.guest + ' (' + b.people + ') - Részletekért kattints!">' +
+          '<span class="bar-title">' + b.guest + '</span>' +
+          '<span class="bar-info">' + (b.people ? '(' + b.people + ')' : '') + '</span>' +
+          (b.note ? '<span class="bar-note">👶 Kiságy</span>' : '') +
+          (b.isTurnoverOut ? '<span class="bar-turnover-edge" title="Turnover nap! Távozás 11h"></span>' : '') +
+        '</div>';
+      }
+    });
+
+    rowsHtml += '</div>';
+  });
+
+  container.innerHTML = headerHtml + rowsHtml;
+}
+
+function navigateDays(delta) {
+  timelineOffsetDays += delta;
+  renderTimeline();
+}
+
+function navigateToday() {
+  timelineOffsetDays = 0;
+  renderTimeline();
+  showToast('📅 Visszaugrottunk a mai naphoz!');
+}
+
+async function handleCleanToggle(chk) {
+  const bId = chk.dataset.bid;
+  const apt = chk.dataset.apt;
+  const isDone = chk.checked;
+
+  const targetBooking = PROCESSED_BOOKINGS.find(b => b.id === bId);
+  if (targetBooking) {
+    targetBooking.cleanedStatus = isDone ? 'done' : 'pending';
+  }
+
+  renderList();
+
+  try {
+    const res = await fetch('?action=toggle-cleaned', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ booking_id: bId, is_done: isDone })
+    });
+    const result = await res.json();
+    if (result.success) {
+      if (isDone) {
+        showToast('✨ <strong>Takarítás kész!</strong> (' + apt + ')<br><span style="font-size:11px; opacity:0.85;">💬 WhatsApp üzenet azonnal elküldve Ferencnek!</span>');
+      } else {
+        showToast('↩️ Visszavonva: ' + apt);
+      }
+    } else {
+      showToast('⚠️ Hiba a mentés során: ' + result.error);
+    }
+  } catch (err) {
+    showToast('⚠️ Hálózati hiba a státusz mentésekor');
+  }
+}
+
+let currentModalCode = '';
+function openBookingModal(bId) {
+  const b = PROCESSED_BOOKINGS.find(x => x.id === bId);
+  if (!b) return;
+
+  document.getElementById('mPropName').textContent = b.apt;
+  document.getElementById('mDateSpan').textContent = b.startDateStr + ' – ' + b.endDateStr;
+  document.getElementById('mGuestName').textContent = b.guest;
+  document.getElementById('mGuestPeople').textContent = b.people || '-';
+  document.getElementById('mCheckout').textContent = b.checkOutTime;
+  document.getElementById('mCheckin').textContent = b.checkInTime;
+  document.getElementById('mCodeBtn').textContent = b.lockbox;
+  currentModalCode = b.lockbox;
+
+  const noteBox = document.getElementById('mNoteBox');
+  if (b.note) {
+    noteBox.style.display = 'block';
+    document.getElementById('mNoteText').textContent = b.note;
+  } else {
+    noteBox.style.display = 'none';
+  }
+
+  document.getElementById('bookingModal').style.display = 'flex';
+}
+
+function closeModal(e) {
+  document.getElementById('bookingModal').style.display = 'none';
+}
+
+function copyModalCode() {
+  copyDirectText(currentModalCode);
+  const btn = document.getElementById('mCodeBtn');
+  btn.textContent = 'Másolva';
+  setTimeout(() => { btn.textContent = currentModalCode; }, 1200);
+}
+
+function copyDirectText(text) {
+  try { navigator.clipboard.writeText(text); } catch (e) {}
+  showToast('🔑 Kód (#' + text + ') a vágólapra másolva!');
+}
+
+document.addEventListener('click', ev => {
+  const b = ev.target.closest('.code:not(#mCodeBtn)');
+  if (b) {
+    const k = b.dataset.k;
+    copyDirectText(k);
+    b.textContent = 'Másolva';
+    setTimeout(() => { b.textContent = k; }, 1200);
+  }
+});
+
+function openIcalModal() {
+  document.getElementById('icalModal').style.display = 'flex';
+}
+
+function switchView(view) {
+  currentView = view;
+  const listView = document.getElementById('listView');
+  const timelineView = document.getElementById('timelineView');
+  const typeFilters = document.getElementById('typeFilters');
+
+  const listBtn = document.getElementById('viewListBtn');
+  const timelineBtn = document.getElementById('viewTimelineBtn');
+
+  if (view === 'timeline') {
+    listView.style.display = 'none';
+    timelineView.style.display = 'block';
+    typeFilters.style.opacity = '0.35';
+    typeFilters.style.pointerEvents = 'none';
+    listBtn.setAttribute('aria-pressed', 'false');
+    timelineBtn.setAttribute('aria-pressed', 'true');
+    renderTimeline();
+    applyTimelineAreaFilter();
+  } else {
+    listView.style.display = 'block';
+    timelineView.style.display = 'none';
+    typeFilters.style.opacity = '1';
+    typeFilters.style.pointerEvents = 'auto';
+    listBtn.setAttribute('aria-pressed', 'true');
+    timelineBtn.setAttribute('aria-pressed', 'false');
+    renderList();
+  }
+}
+
+function filterArea(area) {
+  currentArea = area;
+  document.querySelectorAll('.area-btn').forEach(b => {
+    b.setAttribute('aria-pressed', b.dataset.a === area ? 'true' : 'false');
+  });
+
+  if (currentView === 'list') {
+    renderList();
+  } else {
+    applyTimelineAreaFilter();
+  }
+}
+
+function applyTimelineAreaFilter() {
+  const golfCard = document.getElementById('golfTimelineCard');
+  const arenaCard = document.getElementById('arenaTimelineCard');
+
+  if (ALLOWED_PROPERTIES.length === 2) {
+    if (golfCard) golfCard.style.display = 'none';
+    if (arenaCard) arenaCard.style.display = 'block';
+    return;
+  }
+  if (ALLOWED_PROPERTIES.length === 3) {
+    if (golfCard) golfCard.style.display = 'block';
+    if (arenaCard) arenaCard.style.display = 'none';
+    return;
+  }
+
+  if (currentArea === 'golf') {
+    if (golfCard) golfCard.style.display = 'block';
+    if (arenaCard) arenaCard.style.display = 'none';
+  } else if (currentArea === 'arena') {
+    if (golfCard) golfCard.style.display = 'none';
+    if (arenaCard) arenaCard.style.display = 'block';
+  } else {
+    if (golfCard) golfCard.style.display = 'block';
+    if (arenaCard) arenaCard.style.display = 'block';
+  }
+}
+
+function filterType(type) {
+  currentType = type;
+  document.querySelectorAll('.type-btn').forEach(b => {
+    b.setAttribute('aria-pressed', b.dataset.f === type ? 'true' : 'false');
+  });
+  renderList();
+}
+
+document.getElementById('q').addEventListener('input', ev => {
+  searchQuery = ev.target.value;
+  renderList();
+});
+
+let toastTimer = null;
+function showToast(htmlMsg) {
+  const t = document.getElementById('toast');
+  t.innerHTML = htmlMsg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.classList.remove('show'); }, 3500);
+}
+
+async function triggerSync() {
+  const btn = document.getElementById('syncBtn');
+  if (!btn) return;
+  const icon = document.getElementById('syncIcon');
+  const txt = document.getElementById('syncText');
+
+  btn.disabled = true;
+  icon.textContent = '⏳';
+  txt.textContent = 'Szinkronizálás...';
+
+  showToast('🔄 Szinkronizálás folyamatban a Lodgify-jal...');
+
+  try {
+    const resp = await fetch('?action=update');
+    const msgTxt = await resp.text();
+
+    if (resp.ok) {
+      showToast('✅ ' + msgTxt);
+      setTimeout(() => location.reload(), 1200);
+    } else {
+      showToast(msgTxt);
+      btn.disabled = false;
+      icon.textContent = '🔄';
+      txt.textContent = 'Frissítés';
+    }
+  } catch (err) {
+    showToast('⚠️ Frissítési hiba: ' + err.message);
+    btn.disabled = false;
+    icon.textContent = '🔄';
+    txt.textContent = 'Frissítés';
+  }
+}
+
 async function logout() {
-  if (!confirm("Biztosan ki szeretnél jelentkezni?")) return;
+  if (!confirm('Biztosan ki szeretnél jelentkezni?')) return;
   try {
     await fetch(window.location.origin + window.location.pathname, {
-      headers: { "Authorization": "Basic " + btoa("invalid_user_logout:logout") }
+      headers: { "Authorization": "Basic " + btoa("logout:logout") }
     });
   } catch (e) {}
   window.location.href = window.location.origin + window.location.pathname;
 }
 
-// Szinkronizálás (Sync)
-async function updateTable() {
-  const btn = document.querySelector("#updateBtn");
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = "⏳ Szinkronizálás folyamatban...";
-  }
-
-  const msg = document.getElementById("syncMsg");
-  try {
-    const resp = await fetch(window.location.pathname + "?action=update");
-    const txt = await resp.text();
-
-    if (msg) {
-      msg.textContent = txt;
-      msg.style.opacity = 1;
-      msg.style.background = resp.ok && !txt.includes("⏳") ? "#10b981" : "#f59e0b";
-      setTimeout(() => { msg.style.opacity = 0; }, 4500);
-    }
-
-    if (resp.ok && !txt.includes("⏳")) {
-      setTimeout(() => location.reload(), 1500);
-    } else {
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = "🔄 Frissítés (Sync)";
-      }
-    }
-  } catch (e) {
-    alert("Frissítési hiba: " + e);
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = "🔄 Frissítés (Sync)";
-    }
-  }
-}
-
-// Oszlop ki/be kapcsolás
-function toggleColumn(event, col) {
-  const checked = event.target.checked;
-  const headers = [...document.querySelectorAll("#bookingTable th")];
-  const idx = headers.findIndex(th => th.textContent.includes(col));
-  if (idx < 0) return;
-  document.querySelectorAll("#bookingTable tr").forEach(tr => {
-    if (tr.cells[idx]) tr.cells[idx].style.display = checked ? "" : "none";
-  });
-}
-
-// Beállítások mentése
-async function saveSettings(formId) {
-  const form = document.getElementById(formId);
-  const name = form.elements['name'].value;
-  const selectedColumns = [];
-
-  form.elements['column'].forEach(checkbox => {
-    if (checkbox.checked) {
-      selectedColumns.push(checkbox.value);
-    }
-  });
-
-  try {
-    const resp = await fetch(window.location.pathname + '?action=save-settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: name, columns: selectedColumns })
-    });
-
-    const msg = document.getElementById("syncMsg");
-    if (msg) {
-      msg.textContent = resp.ok ? '✅ ' + name + ' sikeresen mentve!' : '⚠️ Nem sikerült a mentés.';
-      msg.style.opacity = 1;
-      msg.style.background = resp.ok ? "#10b981" : "#ef4444";
-      setTimeout(() => { msg.style.opacity = 0; }, 3000);
-    }
-
-    if (resp.ok) {
-      setTimeout(() => location.reload(), 800);
-    }
-  } catch (e) {
-    alert("Hiba a mentés során: " + e);
-  }
-}
+renderList();
+applyTimelineAreaFilter();
 </script>
 </body>
 </html>`;
