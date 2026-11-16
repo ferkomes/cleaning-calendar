@@ -1283,17 +1283,35 @@ h1 {
   align-items: flex-end;
 }
 .code {
-  font: 700 16px ui-monospace, Menlo, Consolas, monospace;
-  letter-spacing: .12em;
+  font: 700 14px ui-monospace, Menlo, Consolas, monospace;
+  letter-spacing: .06em;
   border: 1px solid var(--line);
   background: var(--bg);
   color: var(--ink);
   border-radius: 8px;
   padding: 6px 10px;
   cursor: pointer;
-  transition: all 0.15s;
+  transition: all 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
-.code:hover { background: var(--line); }
+.code:hover {
+  background: var(--line);
+  border-color: var(--brand);
+}
+.code.copied {
+  background: #dcfce7 !important;
+  color: #166534 !important;
+  border-color: #86efac !important;
+}
+.code-empty {
+  font-weight: 500;
+  color: var(--mute);
+  opacity: 0.6;
+  cursor: default !important;
+  border-style: dashed;
+}
 
 .chk {
   display: flex;
@@ -1528,18 +1546,20 @@ h1 {
   border-radius: 8px;
   display: flex;
   align-items: center;
-  padding: 0 10px;
+  gap: 6px;
+  padding: 0 8px;
   color: white;
   font-size: 12px;
   font-weight: 700;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   box-shadow: 0 2px 4px rgba(0,0,0,0.12);
   cursor: pointer;
   z-index: 5;
   transition: transform 0.15s ease, box-shadow 0.15s ease;
   position: relative;
+  overflow: hidden;
+}
+.booking-span-bar.turnover-out {
+  padding-right: 14px;
 }
 .booking-span-bar:hover {
   transform: translateY(-1px);
@@ -1548,23 +1568,59 @@ h1 {
 }
 
 .booking-span-bar .bar-title {
-  font-family: "Bricolage Grotesque", sans-serif;
+  font-family: "Bricolage Grotesque", system-ui, sans-serif;
   font-size: 13px;
   font-weight: 700;
-  margin-right: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 .booking-span-bar .bar-info {
   font-size: 11px;
   font-weight: 500;
   opacity: 0.9;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 .booking-span-bar .bar-note {
   background: rgba(0,0,0,0.25);
   padding: 1px 6px;
   border-radius: 4px;
   font-size: 10px;
-  margin-left: 6px;
   font-weight: 700;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.booking-span-bar .bar-code {
+  background: rgba(0, 0, 0, 0.32);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  color: #fff;
+  border-radius: 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  padding: 2px 6px;
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  white-space: nowrap;
+  cursor: copy;
+  transition: all 0.15s ease;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+}
+.booking-span-bar .bar-code:hover {
+  background: rgba(255, 255, 255, 0.28);
+  border-color: #fff;
+  transform: scale(1.05);
+}
+.booking-span-bar .bar-code.empty {
+  opacity: 0.6;
+  font-weight: 500;
+  cursor: default;
 }
 
 .bar-turnover-edge {
@@ -1809,9 +1865,9 @@ h1 {
     </div>
 
     <div style="display:flex; justify-content:space-between; align-items:center; margin-top:14px; border-top:1px solid var(--line); padding-top:12px;">
-      <div style="display:flex; align-items:center; gap:6px;">
-        <span style="font-size:13px; font-weight:700;">Széf:</span>
-        <button class="code" id="mCodeBtn" onclick="copyModalCode()">-</button>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span style="font-size:13px; font-weight:700;">Széfkód:</span>
+        <button class="code" id="mCodeBtn" onclick="copyModalCode()" title="Kattints a másoláshoz">🔑 -</button>
       </div>
       <button class="nav-btn" onclick="document.getElementById('bookingModal').style.display='none'">Bezárás</button>
     </div>
@@ -1893,6 +1949,11 @@ const PROCESSED_BOOKINGS = (RAW_BOOKINGS || []).map(b => {
   const isArena = pName.includes('Banana') || pName.includes('Pirate');
   const area = isArena ? 'arena' : 'golf';
 
+  const rawPhone = String(b.guest_phone || '').replace(/[^0-9]/g, '');
+  const phoneLast4 = rawPhone.length >= 4 ? rawPhone.slice(-4) : '';
+  const cleanLockbox = String(b.lockbox_code || '').replace('.0', '').trim();
+  const finalCode = (cleanLockbox && cleanLockbox !== '-') ? cleanLockbox : phoneLast4;
+
   return {
     id: String(b.booking_id).replace('.0', ''),
     apt: pName,
@@ -1900,7 +1961,7 @@ const PROCESSED_BOOKINGS = (RAW_BOOKINGS || []).map(b => {
     guest: b.guest_name || 'Vendég',
     people: b.people || '',
     phone: b.guest_phone || '',
-    lockbox: b.lockbox_code || '-',
+    lockbox: finalCode,
     startOffset: startOffset,
     endOffset: endOffset,
     startDateStr: b.check_in_date,
@@ -1985,6 +2046,11 @@ function renderList() {
     let rowsHtml = filtered.filter(e => e.d === n).map(e => {
       const allProps = [...PROPERTIES_CONFIG.golf, ...PROPERTIES_CONFIG.arena];
       const propInfo = allProps.find(p => p.name === e.apt) || { color: '#64748b' };
+      const hasCode = e.lockbox && e.lockbox !== '-';
+      const codeHtml = hasCode
+        ? '<button class="code" data-k="' + e.lockbox + '" title="Széfkód másolása: ' + e.lockbox + '">🔑 ' + e.lockbox + '</button>'
+        : '<span class="code code-empty" title="Nincs megadott széfkód / telefonszám">🔑 —</span>';
+
       return '<div class="row ' + e.t + (e.isCleaned ? ' done' : '') + '">' +
         '<span class="bar" style="background:' + propInfo.color + '"></span>' +
         '<div class="time">' + e.time + '</div>' +
@@ -1998,7 +2064,7 @@ function renderList() {
           (e.note ? '<div class="note">👶 ' + e.note + '</div>' : '') +
         '</div>' +
         '<div class="act">' +
-          '<button class="code" data-k="' + e.lockbox + '" title="Széfkód másolása">' + e.lockbox + '</button>' +
+          codeHtml +
           '<label class="chk">' +
             '<input type="checkbox" data-bid="' + e.bookingId + '" data-apt="' + e.apt + '" ' + (e.isCleaned ? 'checked' : '') + ' onchange="handleCleanToggle(this)">' +
             'Kész' +
@@ -2068,8 +2134,12 @@ function renderMatrixForRegion(regionKey, containerId, propertiesList, startDay,
   headerHtml += '</div>';
 
   let rowsHtml = '';
+  const s = searchQuery.toLowerCase().trim();
   propertiesList.forEach(prop => {
-    const aptBookings = PROCESSED_BOOKINGS.filter(b => b.apt === prop.name);
+    let aptBookings = PROCESSED_BOOKINGS.filter(b => b.apt === prop.name);
+    if (s) {
+      aptBookings = aptBookings.filter(b => (b.apt + b.guest + (b.lockbox || '') + (b.note || '')).toLowerCase().includes(s));
+    }
 
     let bgSlotsHtml = '';
     days.forEach(dIdx => {
@@ -2099,10 +2169,16 @@ function renderMatrixForRegion(regionKey, containerId, propertiesList, startDay,
         const rR = isEndClipped ? '0' : '6px';
         const radiusStyle = 'border-radius: ' + rL + ' ' + rR + ' ' + rR + ' ' + rL + ';';
 
-        barsHtml += '<div class="booking-span-bar" data-bid="' + b.id + '" style="grid-row:1; grid-column: ' + colStart + ' / ' + colEnd + '; background: ' + prop.color + '; ' + radiusStyle + '; margin: 0 1px;" onclick="openBookingModal(this.dataset.bid)" title="' + b.guest + ' (' + b.people + ') - Részletekért kattints!">' +
+        const hasCode = b.lockbox && b.lockbox !== '-';
+        const codeBadge = hasCode
+          ? '<span class="bar-code" data-code="' + b.lockbox + '" title="Széfkód: ' + b.lockbox + ' (Kattints a másoláshoz!)" onclick="event.stopPropagation(); copyDirectText(this.dataset.code)">🔑 ' + b.lockbox + '</span>'
+          : '';
+
+        barsHtml += '<div class="booking-span-bar' + (b.isTurnoverOut ? ' turnover-out' : '') + '" data-bid="' + b.id + '" style="grid-row:1; grid-column: ' + colStart + ' / ' + colEnd + '; background: ' + prop.color + '; ' + radiusStyle + '; margin: 0 1px;" onclick="openBookingModal(this.dataset.bid)" title="' + b.guest + ' (' + b.people + ') ' + (hasCode ? '[Széfkód: ' + b.lockbox + ']' : '') + ' - Részletekért kattints!">' +
           '<span class="bar-title">' + b.guest + '</span>' +
           '<span class="bar-info">' + (b.people ? '(' + b.people + ')' : '') + '</span>' +
           (b.note ? '<span class="bar-note">👶 Kiságy</span>' : '') +
+          codeBadge +
           (b.isTurnoverOut ? '<span class="bar-turnover-edge" title="Turnover nap! Távozás 11h, új vendég 16h"></span>' : '') +
         '</div>';
       }
@@ -2176,8 +2252,23 @@ function openBookingModal(bId) {
   document.getElementById('mGuestPeople').textContent = b.people || '-';
   document.getElementById('mCheckout').textContent = b.checkOutTime;
   document.getElementById('mCheckin').textContent = b.checkInTime;
-  document.getElementById('mCodeBtn').textContent = b.lockbox;
-  currentModalCode = b.lockbox;
+
+  const mCodeBtn = document.getElementById('mCodeBtn');
+  if (b.lockbox && b.lockbox !== '-') {
+    mCodeBtn.innerHTML = '🔑 ' + b.lockbox;
+    mCodeBtn.className = 'code';
+    mCodeBtn.dataset.k = b.lockbox;
+    mCodeBtn.style.opacity = '1';
+    mCodeBtn.style.cursor = 'pointer';
+    currentModalCode = b.lockbox;
+  } else {
+    mCodeBtn.innerHTML = '🔑 Nincs kód';
+    mCodeBtn.className = 'code code-empty';
+    mCodeBtn.dataset.k = '';
+    mCodeBtn.style.opacity = '0.6';
+    mCodeBtn.style.cursor = 'default';
+    currentModalCode = '';
+  }
 
   const noteBox = document.getElementById('mNoteBox');
   if (b.note) {
@@ -2195,24 +2286,37 @@ function closeModal(e) {
 }
 
 function copyModalCode() {
+  if (!currentModalCode || currentModalCode === '-') return;
   copyDirectText(currentModalCode);
   const btn = document.getElementById('mCodeBtn');
-  btn.textContent = 'Másolva';
-  setTimeout(() => { btn.textContent = currentModalCode; }, 1200);
+  const orig = btn.innerHTML;
+  btn.classList.add('copied');
+  btn.innerHTML = '✓ Másolva';
+  setTimeout(() => {
+    btn.classList.remove('copied');
+    btn.innerHTML = orig;
+  }, 1200);
 }
 
 function copyDirectText(text) {
+  if (!text || text === '-') return;
   try { navigator.clipboard.writeText(text); } catch (e) {}
-  showToast('🔑 Kód (#' + text + ') a vágólapra másolva!');
+  showToast('🔑 Széfkód (<strong>' + text + '</strong>) a vágólapra másolva!');
 }
 
 document.addEventListener('click', ev => {
-  const b = ev.target.closest('.code:not(#mCodeBtn)');
+  const b = ev.target.closest('.code:not(#mCodeBtn):not(.code-empty)');
   if (b) {
     const k = b.dataset.k;
+    if (!k || k === '-') return;
     copyDirectText(k);
-    b.textContent = 'Másolva';
-    setTimeout(() => { b.textContent = k; }, 1200);
+    const origHtml = b.innerHTML;
+    b.classList.add('copied');
+    b.innerHTML = '✓ Másolva';
+    setTimeout(() => {
+      b.classList.remove('copied');
+      b.innerHTML = origHtml;
+    }, 1200);
   }
 });
 
@@ -2300,6 +2404,7 @@ function filterType(type) {
 document.getElementById('q').addEventListener('input', ev => {
   searchQuery = ev.target.value;
   renderList();
+  renderTimeline();
 });
 
 let toastTimer = null;
