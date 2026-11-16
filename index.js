@@ -335,25 +335,25 @@ export default {
 
       // 1. Szerepkör: Kata (La-Arena) -> Kizárólag Banana és Pirate apartmanok
       if (auth.role === "la-arena") {
-        return await serveTable(env, ["The Banana", "The Pirate"], "La-Arena (Kata)", auth, host);
+        return await serveTable(env, ["The Banana", "The Pirate"], "La Arena", auth, host);
       }
 
       // 2. Szerepkör: Gábor (Golf-del-Sur) -> Kizárólag Tucan, Colibri, Albatros apartmanok
       if (auth.role === "golf-del-sur") {
-        return await serveTable(env, ["The Tucan", "The Colibri", "The Albatros"], "Golf-del-Sur (Gábor)", auth, host);
+        return await serveTable(env, ["The Tucan", "The Colibri", "The Albatros"], "Golf del Sur", auth, host);
       }
 
       // 3. Szerepkör: Admin -> Dinamikus szűrés a nézetek között
       if (pathname === "/la-arena" || view === "la-arena") {
-        return await serveTable(env, ["The Banana", "The Pirate"], "La-Arena (Kata)", auth, host);
+        return await serveTable(env, ["The Banana", "The Pirate"], "La Arena", auth, host);
       }
 
       if (pathname === "/golf-del-sur" || view === "golf-del-sur") {
-        return await serveTable(env, ["The Tucan", "The Colibri", "The Albatros"], "Golf-del-Sur (Gábor)", auth, host);
+        return await serveTable(env, ["The Tucan", "The Colibri", "The Albatros"], "Golf del Sur", auth, host);
       }
 
-      // Alapértelmezett nézet Adminnak: Összes apartman (All Bookings)
-      return await serveTable(env, [], "All Bookings", auth, host);
+      // Alapértelmezett nézet Adminnak: Összes apartman
+      return await serveTable(env, [], "Tenerife Takarítás", auth, host);
     } catch (err) {
       await logIssue(env, `Uncaught error in fetch handler: ${err.message}\nStack: ${err.stack}`);
       return new Response(`Uncaught Exception: ${err.message}\n\nStack:\n${err.stack}`, {
@@ -1778,32 +1778,6 @@ h1 {
       </div>
     </div>
 
-    ${isAdmin ? `
-    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;">
-      <button type="button" onclick="location.href='?view=all'" class="nav-btn ${title === 'All Bookings' ? 'nav-btn-today' : ''}">Összes apartman</button>
-      <button type="button" onclick="location.href='?view=la-arena'" class="nav-btn ${title.includes('La-Arena') ? 'nav-btn-today' : ''}">La-Arena (Kata)</button>
-      <button type="button" onclick="location.href='?view=golf-del-sur'" class="nav-btn ${title.includes('Golf-del-Sur') ? 'nav-btn-today' : ''}">Golf-del-Sur (Gábor)</button>
-      <button type="button" onclick="location.href='?view=logs'" class="nav-btn">Rendszernaplók</button>
-      <button type="button" onclick="openIcalModal()" class="nav-btn" style="color:var(--focus);">📅 iCal Linkek</button>
-    </div>
-    ` : ''}
-
-    <!-- KPI SUMMARIES -->
-    <div class="sum" id="sum">
-      <div class="hot">
-        <b id="kpiToday">0</b>
-        <span>takarítás vár ma</span>
-      </div>
-      <div>
-        <b id="kpiWeek">0</b>
-        <span>feladat 7 napon belül</span>
-      </div>
-      <div>
-        <b id="kpiNotes">0</b>
-        <span>különleges kérés (kiságy)</span>
-      </div>
-    </div>
-
     <!-- CONTROLS -->
     <div class="tools">
       <div class="tools-row">
@@ -1829,8 +1803,8 @@ h1 {
         <!-- Művelet szűrő (csak lista nézetben látszik) -->
         <div class="seg" id="typeFilters" role="group" aria-label="Szűrés">
           <button class="type-btn" data-f="all" aria-pressed="true" onclick="filterType('all')">Mind</button>
-          <button class="type-btn" data-f="out" aria-pressed="false" onclick="filterType('out')">Takarítás (11h)</button>
-          <button class="type-btn" data-f="in" aria-pressed="false" onclick="filterType('in')">Érkezés (16h)</button>
+          <button class="type-btn" data-f="out" aria-pressed="false" onclick="filterType('out')">Check-Out (11h)</button>
+          <button class="type-btn" data-f="in" aria-pressed="false" onclick="filterType('in')">Check-In (16h)</button>
         </div>
       </div>
     </div>
@@ -1882,6 +1856,13 @@ h1 {
     </div>
 
   </div>
+
+  ${isAdmin ? `
+  <footer class="page-footer" style="margin-top:36px; padding:20px 0; border-top:1px solid var(--line); display:flex; justify-content:center; gap:12px; flex-wrap:wrap;">
+    <button type="button" onclick="location.href='?view=logs'" class="nav-btn">📋 Rendszernaplók</button>
+    <button type="button" onclick="openIcalModal()" class="nav-btn" style="color:var(--focus);">📅 iCal Linkek</button>
+  </footer>
+  ` : ''}
 
 </main>
 
@@ -2100,7 +2081,7 @@ function renderList() {
         '<div class="time">' + e.time + '</div>' +
         '<div class="mid">' +
           '<div>' +
-            '<span class="badge">' + (e.t === 'out' ? 'Takarítás' : 'Érkezés') + '</span>' +
+            '<span class="badge">' + (e.t === 'out' ? 'Check-Out' : 'Check-In') + '</span>' +
             (e.turnover ? '<span class="turnover-pill">⚡ Turnover</span>' : '') +
           '</div>' +
           '<div class="apt">' + e.apt + '</div>' +
@@ -2127,14 +2108,18 @@ function renderList() {
 }
 
 function updateKPIs() {
+  const elToday = document.getElementById('kpiToday');
+  if (!elToday) return;
   const activeBookings = PROCESSED_BOOKINGS.filter(b => (currentArea === 'all') || (b.area === currentArea));
   const todo = activeBookings.filter(b => b.endOffset === 0 && b.cleanedStatus !== 'done').length;
   const week = activeBookings.filter(b => (b.startOffset >= 0 && b.startOffset <= 6) || (b.endOffset >= 0 && b.endOffset <= 6)).length;
   const notes = activeBookings.filter(b => b.note && ((b.startOffset >= 0 && b.startOffset <= 6) || (b.endOffset >= 0 && b.endOffset <= 6))).length;
 
-  document.getElementById('kpiToday').textContent = todo;
-  document.getElementById('kpiWeek').textContent = week;
-  document.getElementById('kpiNotes').textContent = notes;
+  elToday.textContent = todo;
+  const elWeek = document.getElementById('kpiWeek');
+  if (elWeek) elWeek.textContent = week;
+  const elNotes = document.getElementById('kpiNotes');
+  if (elNotes) elNotes.textContent = notes;
 }
 
 function changeTimelineSpan(count) {
