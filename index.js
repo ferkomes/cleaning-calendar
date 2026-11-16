@@ -1550,15 +1550,15 @@ h1 {
   right: 0;
   top: 0;
   bottom: 0;
-  width: 24px;
+  width: 10px;
   background: repeating-linear-gradient(
     45deg,
     rgba(220, 38, 38, 0.8),
-    rgba(220, 38, 38, 0.8) 4px,
-    rgba(255, 255, 255, 0.3) 4px,
-    rgba(255, 255, 255, 0.3) 8px
+    rgba(220, 38, 38, 0.8) 3px,
+    rgba(255, 255, 255, 0.3) 3px,
+    rgba(255, 255, 255, 0.3) 6px
   );
-  border-radius: 0 8px 8px 0;
+  border-radius: 0 6px 6px 0;
 }
 
 /* Toast Message */
@@ -2035,13 +2035,13 @@ function renderMatrixForRegion(regionKey, containerId, propertiesList, startDay,
   const days = [];
   for (let i = 0; i < count; i++) days.push(startDay + i);
 
-  let headerHtml = '<div class="matrix-header-row" style="grid-template-columns: 130px repeat(' + count + ', 50px);"><div style="font-size:12px; font-weight:800; color:var(--mute); padding-left:4px;">Apartman</div>';
+  let headerHtml = '<div class="matrix-header-row" style="grid-template-columns: 130px repeat(' + (count * 2) + ', 25px);"><div style="font-size:12px; font-weight:800; color:var(--mute); padding-left:4px;">Apartman</div>';
   days.forEach(dIdx => {
     const dObj = getDayDate(dIdx);
     const isToday = (dIdx === 0);
     const dayShort = dIdx === 0 ? 'Ma' : dObj.toLocaleDateString('hu-HU', { weekday: 'short' });
     const dateNum = dObj.getDate();
-    headerHtml += '<div class="matrix-day-cell' + (isToday ? ' today' : '') + '">' + dayShort + '<small>' + dateNum + '.</small></div>';
+    headerHtml += '<div class="matrix-day-cell' + (isToday ? ' today' : '') + '" style="grid-column: span 2;">' + dayShort + '<small>' + dateNum + '.</small></div>';
   });
   headerHtml += '</div>';
 
@@ -2049,7 +2049,7 @@ function renderMatrixForRegion(regionKey, containerId, propertiesList, startDay,
   propertiesList.forEach(prop => {
     const aptBookings = PROCESSED_BOOKINGS.filter(b => b.apt === prop.name);
 
-    rowsHtml += '<div class="matrix-apt-row" style="grid-template-columns: 130px repeat(' + count + ', 50px);">' +
+    rowsHtml += '<div class="matrix-apt-row" style="grid-template-columns: 130px repeat(' + (count * 2) + ', 25px);">' +
       '<div class="matrix-apt-title">' +
         '<span class="dot" style="background:' + prop.color + ';"></span>' +
         '<span class="name">' + prop.name + '</span>' +
@@ -2057,23 +2057,34 @@ function renderMatrixForRegion(regionKey, containerId, propertiesList, startDay,
 
     days.forEach(dIdx => {
       const isToday = (dIdx === 0);
-      rowsHtml += '<div class="matrix-bg-slot' + (isToday ? ' is-today' : '') + '"></div>';
+      rowsHtml += '<div class="matrix-bg-slot' + (isToday ? ' is-today' : '') + '" style="grid-column: span 2;"></div>';
     });
 
     aptBookings.forEach(b => {
-      if (b.endOffset >= startDay && b.startOffset <= (startDay + count - 1)) {
-        const colStart = Math.max(1, b.startOffset - startDay + 1) + 1;
-        const colEnd = Math.min(count, b.endOffset - startDay + 1) + 2;
+      const minLine = 2;
+      const maxLine = 2 + (count * 2);
 
-        const isStartClipped = b.startOffset < startDay;
-        const isEndClipped = b.endOffset > (startDay + count - 1);
-        const radiusStyle = 'border-radius: ' + (isStartClipped ? '0' : '8px') + ' ' + (isEndClipped ? '0' : '8px') + ' ' + (isEndClipped ? '0' : '8px') + ' ' + (isStartClipped ? '0' : '8px') + ';';
+      // Érkezés: a bejelentkezés napjának DÉLI felezőpontjától indul (16h érkezés)
+      const rawStart = 2 + (b.startOffset - startDay) * 2 + 1;
+      // Távozás: a kijelentkezés napjának DÉLI felezőpontjáig tart (11h távozás)
+      const rawEnd = 2 + (b.endOffset - startDay) * 2 + 1;
 
-        rowsHtml += '<div class="booking-span-bar" data-bid="' + b.id + '" style="grid-column: ' + colStart + ' / ' + colEnd + '; background: ' + prop.color + '; ' + radiusStyle + '" onclick="openBookingModal(this.dataset.bid)" title="' + b.guest + ' (' + b.people + ') - Részletekért kattints!">' +
+      const colStart = Math.max(minLine, rawStart);
+      const colEnd = Math.min(maxLine, rawEnd);
+
+      if (colEnd > colStart) {
+        const isStartClipped = rawStart < minLine;
+        const isEndClipped = rawEnd > maxLine;
+
+        const rL = isStartClipped ? '0' : '6px';
+        const rR = isEndClipped ? '0' : '6px';
+        const radiusStyle = 'border-radius: ' + rL + ' ' + rR + ' ' + rR + ' ' + rL + ';';
+
+        rowsHtml += '<div class="booking-span-bar" data-bid="' + b.id + '" style="grid-column: ' + colStart + ' / ' + colEnd + '; background: ' + prop.color + '; ' + radiusStyle + '; margin: 0 1px;" onclick="openBookingModal(this.dataset.bid)" title="' + b.guest + ' (' + b.people + ') - Részletekért kattints!">' +
           '<span class="bar-title">' + b.guest + '</span>' +
           '<span class="bar-info">' + (b.people ? '(' + b.people + ')' : '') + '</span>' +
           (b.note ? '<span class="bar-note">👶 Kiságy</span>' : '') +
-          (b.isTurnoverOut ? '<span class="bar-turnover-edge" title="Turnover nap! Távozás 11h"></span>' : '') +
+          (b.isTurnoverOut ? '<span class="bar-turnover-edge" title="Turnover nap! Távozás 11h, új vendég 16h"></span>' : '') +
         '</div>';
       }
     });
