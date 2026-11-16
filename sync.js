@@ -116,15 +116,20 @@ async function sync() {
 
   console.log(`✅ Valid active bookings + closed periods: ${validBookings.length}`);
 
-  // 3. Check any active upcoming bookings that were not in the v2 paginated list
+  // 3. Check any active upcoming bookings individually for notes AND lockbox door codes (Airbnb)
   const today = new Date().toISOString().slice(0, 10);
+  const extraDetailsMap = new Map();
+
   const missingV2Bookings = validBookings.filter(item => {
     const id = String(item.id).replace('.0', '');
-    return item.type === "Booking" && item.departure >= today && !notesMap.has(id);
+    const hasPhone = item.guest && item.guest.phone;
+    const hasRoomCode = item.rooms && item.rooms[0]?.key_code;
+    const hasNote = notesMap.has(id);
+    return item.type === "Booking" && item.departure >= today && (!hasNote || (!hasPhone && !hasRoomCode));
   });
 
   if (missingV2Bookings.length > 0) {
-    console.log(`🔍 Checking ${missingV2Bookings.length} active bookings individually for notes...`);
+    console.log(`🔍 Checking ${missingV2Bookings.length} active bookings individually for notes & Airbnb lockbox door codes...`);
     await Promise.all(missingV2Bookings.map(async item => {
       const id = String(item.id).replace('.0', '');
       try {
@@ -136,6 +141,7 @@ async function sync() {
         });
         if (resp.ok) {
           const detail = await resp.json();
+          extraDetailsMap.set(id, detail);
           const noteText = cleanNote(detail.notes);
           if (noteText) {
             notesMap.set(id, noteText);
@@ -145,7 +151,7 @@ async function sync() {
     }));
   }
 
-  console.log(`📝 Total bookings with notes identified: ${notesMap.size}`);
+  console.log(`📝 Total bookings with notes identified: ${notesMap.size}, extra details: ${extraDetailsMap.size}`);
 
   const rows = validBookings.map(item => {
     const bookingId = String(item.id).replace('.0', '');
@@ -157,10 +163,27 @@ async function sync() {
       breakdown.infants ? `${breakdown.infants} infant${breakdown.infants > 1 ? "s" : ""}` : ""
     ].filter(Boolean).join(", ") || (item.people ? `${item.people} adult${item.people > 1 ? "s" : ""}` : "");
 
-    const guestPhone = guest.phone || "";
+    const v2Detail = extraDetailsMap.get(bookingId);
+    let ext = {};
+    if (v2Detail) {
+      if (typeof v2Detail.external_booking === "string") {
+        try { ext = JSON.parse(v2Detail.external_booking); } catch (_) {}
+      } else if (typeof v2Detail.external_booking === "object" && v2Detail.external_booking) {
+        ext = v2Detail.external_booking;
+      }
+    }
+    const suggestedDoorCode = ext["Suggested Door Code"] || ext["suggested_door_code"] || "";
+    const phoneList = ext["Phone Numbers"] || ext["phone_numbers"] || [];
+    const phoneFromExt = (Array.isArray(phoneList) && phoneList.length > 0) ? String(phoneList[0]) : "";
+
+    const guestPhone = guest.phone || (v2Detail && v2Detail.guest?.phone) || phoneFromExt || "";
     const rawLockbox = String(guestPhone).replace(/[^0-9]/g, '');
-    const lockboxFromPhone = rawLockbox.slice(-4) || "";
-    const lockbox = (item.rooms && item.rooms[0]?.key_code) || lockboxFromPhone || "";
+    const lockboxFromPhone = rawLockbox.length >= 4 ? rawLockbox.slice(-4) : "";
+    const lockbox = (item.rooms && item.rooms[0]?.key_code)
+      || (v2Detail && v2Detail.rooms && v2Detail.rooms[0]?.key_code)
+      || suggestedDoorCode
+      || lockboxFromPhone
+      || "";
 
     const propName = PROPERTIES_MAP[item.property_id] || item.property_name || `Property #${item.property_id}`;
     const guestName = guest.name || (item.type === "ClosedPeriod" ? "Closed" : "");
@@ -277,7 +300,7 @@ async function sync() {
           `📅 *Llegada / Érkezés:* ${checkInFormatted}`,
           `📅 *Salida / Távozás:* ${checkOutFormatted}`,
           `📞 *Teléfono:* ${b.guest_phone || 'N/A'}`,
-          `🔑 *Lockbox / Széf:* ${b.lockbox_code || '-'}`,
+          `🔑 *Lockbox (kulcsszéf):* ${b.lockbox_code || '-'}`,
           `📝 *Notas / Megjegyzés:* ${b.note || 'Nincs / Ninguna'}`,
           ``,
           `🆔 *ID:* #${bId}`

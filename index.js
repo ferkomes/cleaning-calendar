@@ -466,7 +466,34 @@ async function updateAllBookings(env) {
     console.warn("Worker v2 notes fetch warning:", err.message);
   }
 
-  const mappedRows = validBookings.map(item => mapBooking(item, PROPERTIES_MAP, notesMap));
+  // Airbnb Lockbox kódok és részletek lekérése (Suggested Door Code)
+  const extraDetailsMap = new Map();
+  const today = new Date().toISOString().slice(0, 10);
+  const needsV2Detail = validBookings.filter(item => {
+    const id = String(item.id).replace('.0', '');
+    const hasPhone = item.guest && item.guest.phone;
+    const hasRoomCode = item.rooms && item.rooms[0]?.key_code;
+    return item.type === "Booking" && item.departure >= today && (!hasPhone && !hasRoomCode);
+  });
+
+  if (needsV2Detail.length > 0) {
+    await Promise.all(needsV2Detail.map(async item => {
+      const id = String(item.id).replace('.0', '');
+      try {
+        const resp = await fetch(`https://api.lodgify.com/v2/reservations/bookings/${id}`, { headers });
+        if (resp.ok) {
+          const detail = await resp.json();
+          extraDetailsMap.set(id, detail);
+          const noteText = cleanNote(detail.notes);
+          if (noteText && !notesMap.has(id)) {
+            notesMap.set(id, noteText);
+          }
+        }
+      } catch (_) {}
+    }));
+  }
+
+  const mappedRows = validBookings.map(item => mapBooking(item, PROPERTIES_MAP, notesMap, extraDetailsMap));
 
   if (mappedRows.length) {
     const { unnotifiedBookings } = await getUnnotifiedBookings(env, mappedRows);
@@ -484,7 +511,7 @@ async function updateAllBookings(env) {
 }
 
 // --------------------- Mapping and Batch Upsert ---------------------
-function mapBooking(item, propertiesMap = PROPERTIES_MAP, notesMap = new Map()) {
+function mapBooking(item, propertiesMap = PROPERTIES_MAP, notesMap = new Map(), extraDetailsMap = new Map()) {
   const guest = item.guest || {};
   const breakdown = item.total_guest_breakdown || (item.rooms && item.rooms[0]?.guest_breakdown) || {};
   const people = [
@@ -493,15 +520,32 @@ function mapBooking(item, propertiesMap = PROPERTIES_MAP, notesMap = new Map()) 
     breakdown.infants ? `${breakdown.infants} infant${breakdown.infants > 1 ? "s" : ""}` : ""
   ].filter(Boolean).join(", ") || (item.people ? `${item.people} adult${item.people > 1 ? "s" : ""}` : "");
 
-  const guestPhone = guest.phone || "";
+  const bookingId = String(item.id).replace('.0', '');
+  const v2Detail = extraDetailsMap && extraDetailsMap.get(bookingId);
+  let ext = {};
+  if (v2Detail) {
+    if (typeof v2Detail.external_booking === "string") {
+      try { ext = JSON.parse(v2Detail.external_booking); } catch (_) {}
+    } else if (typeof v2Detail.external_booking === "object" && v2Detail.external_booking) {
+      ext = v2Detail.external_booking;
+    }
+  }
+  const suggestedDoorCode = ext["Suggested Door Code"] || ext["suggested_door_code"] || "";
+  const phoneList = ext["Phone Numbers"] || ext["phone_numbers"] || [];
+  const phoneFromExt = (Array.isArray(phoneList) && phoneList.length > 0) ? String(phoneList[0]) : "";
+
+  const guestPhone = guest.phone || (v2Detail && v2Detail.guest?.phone) || phoneFromExt || "";
   const rawLockbox = String(guestPhone).replace(/[^0-9]/g, '');
-  const lockboxFromPhone = rawLockbox.slice(-4) || "";
-  const lockbox = (item.rooms && item.rooms[0]?.key_code) || lockboxFromPhone || "";
+  const lockboxFromPhone = rawLockbox.length >= 4 ? rawLockbox.slice(-4) : "";
+  const lockbox = (item.rooms && item.rooms[0]?.key_code)
+    || (v2Detail && v2Detail.rooms && v2Detail.rooms[0]?.key_code)
+    || suggestedDoorCode
+    || lockboxFromPhone
+    || "";
 
   const propName = propertiesMap[item.property_id] || item.property_name || `Property #${item.property_id}`;
   const guestName = guest.name || (item.type === "ClosedPeriod" ? "Closed" : "");
 
-  const bookingId = String(item.id).replace('.0', '');
   const note = (notesMap && notesMap.get(bookingId)) || (item.notes ? cleanNote(item.notes) : (item.note ? cleanNote(item.note) : ""));
 
   return {
@@ -605,7 +649,7 @@ async function sendNewBookingWhatsAppNotifications(env, unnotifiedBookings) {
       `📅 *Llegada / Érkezés:* ${checkInFormatted}`,
       `📅 *Salida / Távozás:* ${checkOutFormatted}`,
       `📞 *Teléfono:* ${b.guest_phone || 'N/A'}`,
-      `🔑 *Lockbox / Széf:* ${b.lockbox_code || '-'}`,
+      `🔑 *Lockbox (kulcsszéf):* ${b.lockbox_code || '-'}`,
       `📝 *Notas / Megjegyzés:* ${b.note || 'Nincs / Ninguna'}`,
       ``,
       `🆔 *ID:* #${bId}`
@@ -1866,7 +1910,7 @@ h1 {
 
     <div style="display:flex; justify-content:space-between; align-items:center; margin-top:14px; border-top:1px solid var(--line); padding-top:12px;">
       <div style="display:flex; align-items:center; gap:8px;">
-        <span style="font-size:13px; font-weight:700;">Széfkód:</span>
+        <span style="font-size:13px; font-weight:700;">Lockbox:</span>
         <button class="code" id="mCodeBtn" onclick="copyModalCode()" title="Kattints a másoláshoz">🔑 -</button>
       </div>
       <button class="nav-btn" onclick="document.getElementById('bookingModal').style.display='none'">Bezárás</button>
@@ -2048,8 +2092,8 @@ function renderList() {
       const propInfo = allProps.find(p => p.name === e.apt) || { color: '#64748b' };
       const hasCode = e.lockbox && e.lockbox !== '-';
       const codeHtml = hasCode
-        ? '<button class="code" data-k="' + e.lockbox + '" title="Széfkód másolása: ' + e.lockbox + '">🔑 ' + e.lockbox + '</button>'
-        : '<span class="code code-empty" title="Nincs megadott széfkód / telefonszám">🔑 —</span>';
+        ? '<button class="code" data-k="' + e.lockbox + '" title="Lockbox kód másolása: ' + e.lockbox + '">🔑 ' + e.lockbox + '</button>'
+        : '<span class="code code-empty" title="Nincs megadott lockbox kód / telefonszám">🔑 —</span>';
 
       return '<div class="row ' + e.t + (e.isCleaned ? ' done' : '') + '">' +
         '<span class="bar" style="background:' + propInfo.color + '"></span>' +
@@ -2171,10 +2215,10 @@ function renderMatrixForRegion(regionKey, containerId, propertiesList, startDay,
 
         const hasCode = b.lockbox && b.lockbox !== '-';
         const codeBadge = hasCode
-          ? '<span class="bar-code" data-code="' + b.lockbox + '" title="Széfkód: ' + b.lockbox + ' (Kattints a másoláshoz!)" onclick="event.stopPropagation(); copyDirectText(this.dataset.code)">🔑 ' + b.lockbox + '</span>'
+          ? '<span class="bar-code" data-code="' + b.lockbox + '" title="Lockbox kód: ' + b.lockbox + ' (Kattints a másoláshoz!)" onclick="event.stopPropagation(); copyDirectText(this.dataset.code)">🔑 ' + b.lockbox + '</span>'
           : '';
 
-        barsHtml += '<div class="booking-span-bar' + (b.isTurnoverOut ? ' turnover-out' : '') + '" data-bid="' + b.id + '" style="grid-row:1; grid-column: ' + colStart + ' / ' + colEnd + '; background: ' + prop.color + '; ' + radiusStyle + '; margin: 0 1px;" onclick="openBookingModal(this.dataset.bid)" title="' + b.guest + ' (' + b.people + ') ' + (hasCode ? '[Széfkód: ' + b.lockbox + ']' : '') + ' - Részletekért kattints!">' +
+        barsHtml += '<div class="booking-span-bar' + (b.isTurnoverOut ? ' turnover-out' : '') + '" data-bid="' + b.id + '" style="grid-row:1; grid-column: ' + colStart + ' / ' + colEnd + '; background: ' + prop.color + '; ' + radiusStyle + '; margin: 0 1px;" onclick="openBookingModal(this.dataset.bid)" title="' + b.guest + ' (' + b.people + ') ' + (hasCode ? '[Lockbox: ' + b.lockbox + ']' : '') + ' - Részletekért kattints!">' +
           '<span class="bar-title">' + b.guest + '</span>' +
           '<span class="bar-info">' + (b.people ? '(' + b.people + ')' : '') + '</span>' +
           (b.note ? '<span class="bar-note">👶 Kiságy</span>' : '') +
@@ -2301,7 +2345,7 @@ function copyModalCode() {
 function copyDirectText(text) {
   if (!text || text === '-') return;
   try { navigator.clipboard.writeText(text); } catch (e) {}
-  showToast('🔑 Széfkód (<strong>' + text + '</strong>) a vágólapra másolva!');
+  showToast('🔑 Lockbox kód (<strong>' + text + '</strong>) a vágólapra másolva!');
 }
 
 document.addEventListener('click', ev => {
