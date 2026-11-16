@@ -157,7 +157,7 @@ export default {
               headers: { "Content-Type": "application/json" }
             });
           }
-          const { unnotifiedBookings } = await getUnnotifiedGolfBookings(env, rows);
+          const { unnotifiedBookings } = await getUnnotifiedBookings(env, rows);
           await batchUpsertBookings(env, rows);
           await markSyncDone(env);
           await logIssue(env, `✅ Sikeres szinkronizáció: ${rows.length} foglalás mentve (${auth.username}).`);
@@ -440,7 +440,7 @@ function mapBooking(item, propertiesMap = PROPERTIES_MAP, notesMap = new Map()) 
   };
 }
 
-// --- Új foglalási értesítések küldése (Golf del Sur -> Lymo.canari@gmail.com) ---
+// --- Új foglalási értesítések küldése (Golf del Sur & La Arena) ---
 const GOLF_DEL_SUR_NOTIFICATION_EMAIL = "Lymo.canari@gmail.com";
 
 function isGolfDelSurProperty(propName) {
@@ -449,16 +449,25 @@ function isGolfDelSurProperty(propName) {
   return p.includes("albatros") || p.includes("colibri") || p.includes("tucan");
 }
 
-async function getUnnotifiedGolfBookings(env, rows) {
+function isLaArenaProperty(propName) {
+  if (!propName) return false;
+  const p = propName.trim().toLowerCase();
+  return p.includes("banana") || p.includes("pirate");
+}
+
+async function getUnnotifiedBookings(env, rows) {
   if (!rows || !rows.length || !env.DB) return { unnotifiedBookings: [] };
   try {
-    const golfRows = rows.filter(r => 
-      isGolfDelSurProperty(r.property_name) &&
+    const relevantRows = rows.filter(r => 
+      (isGolfDelSurProperty(r.property_name) || isLaArenaProperty(r.property_name)) &&
       r.guest_name &&
       r.guest_name.trim().toLowerCase() !== "closed"
-    );
+    ).map(r => ({
+      ...r,
+      area: isGolfDelSurProperty(r.property_name) ? "golf_del_sur" : "la_arena"
+    }));
 
-    if (!golfRows.length) return { unnotifiedBookings: [] };
+    if (!relevantRows.length) return { unnotifiedBookings: [] };
 
     await env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS email_notifications (
@@ -478,14 +487,14 @@ async function getUnnotifiedGolfBookings(env, rows) {
     ).all();
     const notifiedSet = new Set((notifiedResult.results || []).map(r => String(r.booking_id).replace('.0', '')));
 
-    const unnotifiedBookings = golfRows.filter(r => {
+    const unnotifiedBookings = relevantRows.filter(r => {
       const id = String(r.booking_id).replace('.0', '');
       return !notifiedSet.has(id);
     });
 
     return { unnotifiedBookings };
   } catch (err) {
-    console.error("getUnnotifiedGolfBookings error:", err);
+    console.error("getUnnotifiedBookings error:", err);
     return { unnotifiedBookings: [] };
   }
 }

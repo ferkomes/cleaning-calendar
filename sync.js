@@ -8,14 +8,17 @@ const GOLF_DEL_SUR_NOTIFICATION_EMAILS = [
   "Lymo.canari@gmail.com"
 ];
 
+const LA_ARENA_NOTIFICATION_EMAILS = [
+  "Lymo.canari@gmail.com"
+];
+
 const GREEN_API_URL = "https://7107.api.greenapi.com";
 const GREEN_API_ID_INSTANCE = "710722802966";
 const GREEN_API_TOKEN = "51cbdb160011438ebdbf13cef9c18d99111f4e75f6234c5ca3";
 
-const GOLF_DEL_SUR_WHATSAPP_RECIPIENTS = [
-  "31629306180@c.us", // Feri (User)
-  "34660541568@c.us"  // Cleaner (Golf del Sur)
-];
+const FERI_WHATSAPP = "31629306180@c.us"; // Feri - kapja mindet (Golf del Sur + La Arena)
+const GOLF_DEL_SUR_CLEANER_WHATSAPP = "34660541568@c.us"; // Golf del Sur takarító (+34 660 54 15 68)
+const LA_ARENA_CLEANER_WHATSAPP = "36305757170@c.us"; // La Arena takarító (+36 30 575 7170)
 
 const PROPERTIES_MAP = {
   569854: "The Albatros",
@@ -194,28 +197,38 @@ async function sync() {
   if (pushResp.ok && pushResult.success) {
     console.log(`🎉 SUCCESS! Updated ${pushResult.count} bookings in Cleaning Calendar.`);
 
-    // Új Golf del Sur foglalások értesítéseinek kiküldése (Email + WhatsApp)
+    // Új foglalások értesítéseinek kiküldése (Email + WhatsApp)
     const pending = pushResult.pendingNotifications || [];
     if (pending.length > 0) {
-      console.log(`📬 ${pending.length} új Golf del Sur foglalás található, értesítések küldése (Email: ${GOLF_DEL_SUR_NOTIFICATION_EMAILS.join(", ")} | WhatsApp: ${GOLF_DEL_SUR_WHATSAPP_RECIPIENTS.join(", ")})...`);
+      console.log(`📬 ${pending.length} új foglalás található, értesítések küldése folyamatban...`);
       const successfullySent = [];
 
       for (const b of pending) {
         const bId = String(b.booking_id).replace('.0', '');
         let sentForThisBooking = false;
 
+        const isLaArena = (b.area === "la_arena") || 
+          (b.property_name && (b.property_name.toLowerCase().includes("banana") || b.property_name.toLowerCase().includes("pirate")));
+
+        const targetEmails = isLaArena ? LA_ARENA_NOTIFICATION_EMAILS : GOLF_DEL_SUR_NOTIFICATION_EMAILS;
+        const targetWhatsApp = isLaArena 
+          ? [FERI_WHATSAPP, LA_ARENA_CLEANER_WHATSAPP]
+          : [FERI_WHATSAPP, GOLF_DEL_SUR_CLEANER_WHATSAPP];
+
+        const areaName = isLaArena ? "La Arena" : "Golf del Sur";
+
         // 1. Email küldés
-        for (const recipientEmail of GOLF_DEL_SUR_NOTIFICATION_EMAILS) {
+        for (const recipientEmail of targetEmails) {
           try {
             const mailForm = new FormData();
             mailForm.append("name", "Cleaning Calendar");
             mailForm.append("email", recipientEmail);
-            mailForm.append("productName", b.property_name || "Golf del Sur apartman");
-            mailForm.append("subject", `🏨 Új foglalás: ${b.property_name} | ${b.check_in_date} – ${b.departure} (${b.guest_name})`);
+            mailForm.append("productName", b.property_name || `${areaName} apartman`);
+            mailForm.append("subject", `🏨 Új foglalás (${areaName}): ${b.property_name} | ${b.check_in_date} – ${b.departure} (${b.guest_name})`);
             mailForm.append("requestType", "new_tractor_broadcast");
 
             const msgLines = [
-              `Új foglalás érkezett a Golf del Sur apartmanra!`,
+              `Új foglalás érkezett a ${areaName} apartmanra!`,
               ``,
               `Apartman: ${b.property_name}`,
               `Vendég neve: ${b.guest_name || 'Nincs megadva'}`,
@@ -253,7 +266,7 @@ async function sync() {
         const checkOutFormatted = `${b.departure} (${b.check_out_time ? b.check_out_time.slice(0, 5) : '11:00'})`;
 
         const waMessageLines = [
-          `🏨 *NUEVA RESERVA / ÚJ FOGLALÁS*`,
+          `🏨 *NUEVA RESERVA / ÚJ FOGLALÁS (${areaName})*`,
           ``,
           `📍 *Apartamento / Apartman:* ${b.property_name}`,
           `👤 *Huésped / Vendég:* ${b.guest_name || 'N/A'}`,
@@ -268,7 +281,7 @@ async function sync() {
         ];
         const waMessage = waMessageLines.join("\n");
 
-        for (const waRecipient of GOLF_DEL_SUR_WHATSAPP_RECIPIENTS) {
+        for (const waRecipient of targetWhatsApp) {
           try {
             const waRes = await fetch(`${GREEN_API_URL}/waInstance${GREEN_API_ID_INSTANCE}/sendMessage/${GREEN_API_TOKEN}`, {
               method: "POST",
