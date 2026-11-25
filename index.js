@@ -245,33 +245,9 @@ export default {
           const booking = await env.DB.prepare("SELECT * FROM bookings WHERE booking_id = ?").bind(bId).first();
 
           if (is_done && booking) {
-            const nowMadrid = new Date().toLocaleString('hu-HU', { timeZone: 'Europe/Madrid', hour: '2-digit', minute: '2-digit' });
             const isLaArena = isLaArenaProperty(booking.property_name);
             const areaName = isLaArena ? "La Arena" : "Golf del Sur";
-
-            const waMsgLines = [
-              `✨ *TAKARÍTÁS ELVÉGEZVE!*`,
-              ``,
-              `📍 *Apartman:* ${booking.property_name} (${areaName})`,
-              `🧹 *Státusz:* A takarítás befejeződött, a lakás tiszta és fogadásra kész!`,
-              `👤 *Távozó vendég:* ${booking.guest_name || 'Vendég'}`,
-              booking.note ? `📝 *Kérés volt:* ${booking.note}` : null,
-              `⏰ *Befejezve:* ${nowMadrid} (${auth.username})`
-            ].filter(Boolean).join("\n");
-
-            try {
-              await fetch(`${GREEN_API_URL}/waInstance${GREEN_API_ID_INSTANCE}/sendMessage/${GREEN_API_TOKEN}`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  chatId: FERI_WHATSAPP,
-                  message: waMsgLines
-                })
-              });
-              await logIssue(env, `💬 WhatsApp takarítás kész értesítő elküldve Ferencnek: #${bId} (${booking.property_name})`);
-            } catch (waErr) {
-              await logIssue(env, `WhatsApp takarítás küldés hiba: ${waErr.message}`);
-            }
+            await logIssue(env, `✨ Takarítás kész rögzítve: #${bId} (${booking.property_name} – ${areaName}, ${auth.username})`);
           }
 
           return new Response(JSON.stringify({ success: true, booking_id: bId, status: statusVal }), {
@@ -299,6 +275,28 @@ export default {
 
         try {
           await logIssue(env, `Sync manually initiated by ${auth.username}.`);
+          if (env.GITHUB_TOKEN) {
+            const ghRepo = env.GITHUB_REPO || "ferkomes/cleaning-calendar";
+            const ghRes = await fetch(`https://api.github.com/repos/${ghRepo}/actions/workflows/sync.yml/dispatches`, {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${env.GITHUB_TOKEN}`,
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "CleaningCalendarWorker/2.0",
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({ ref: "main" })
+            });
+            if (ghRes.ok || ghRes.status === 204) {
+              await logIssue(env, `🚀 GitHub Actions sync elindítva (${auth.username}).`);
+              return new Response("GH_DISPATCHED|✅ Frissítés elindítva! ~15 másodperc múlva automatikusan frissül az oldal...", {
+                status: 200,
+                headers: { "Content-Type": "text/plain; charset=utf-8" }
+              });
+            }
+            const errTxt = await ghRes.text();
+            await logIssue(env, `GitHub Actions dispatch hiba (HTTP ${ghRes.status}): ${errTxt}`);
+          }
           detailsStatus = "processing";
           const result = await updateAllBookings(env);
           await markSyncDone(env);
@@ -392,13 +390,28 @@ const PROPERTIES_MAP = {
   569857: "The Tucan"
 };
 
+async function fetchLodgifyWithRetry(url, headers, env, label = "Lodgify") {
+  let resp = await fetch(url, { headers });
+  let retries = 0;
+  while (resp.status === 429 && retries < 3) {
+    const retryAfterSec = parseInt(resp.headers.get("Retry-After") || "0", 10);
+    const waitMs = retryAfterSec > 0 ? Math.min(retryAfterSec * 1000, 6000) : 2000 * (retries + 1);
+    await logIssue(env, `${label} 429 rate limit. Waiting ${waitMs}ms (retry #${retries + 1})...`);
+    await delay(waitMs);
+    resp = await fetch(url, { headers });
+    retries++;
+  }
+  return resp;
+}
+
 async function updateAllBookings(env) {
   const apiKey = env.LODGIFY_API_KEY;
   if (!apiKey) throw new Error("LODGIFY_API_KEY nincs beállítva!");
 
   const headers = {
     "X-ApiKey": apiKey,
-    "Accept": "application/json"
+    "Accept": "application/json",
+    "User-Agent": "CleaningCalendar/2.0"
   };
 
   const thirtyDaysAgo = new Date();
@@ -412,18 +425,17 @@ async function updateAllBookings(env) {
   let offset = 0;
   const limit = 50;
   const allItems = [];
+  let usedVersion = "v1";
+  let v1FailedWith429 = false;
 
   while (offset < 400) {
     const url = `https://api.lodgify.com/v1/reservation?offset=${offset}&limit=${limit}&trash=false&periodStart=${periodStart}&periodEnd=${periodEnd}`;
-    let resp = await fetch(url, { headers });
+    const resp = await fetchLodgifyWithRetry(url, headers, env, `Lodgify v1 (offset=${offset})`);
 
-    let retries = 0;
-    while (resp.status === 429 && retries < 3) {
-      const waitMs = 2500 * (retries + 1);
-      await logIssue(env, `Lodgify 429 rate limit (offset=${offset}). Waiting ${waitMs}ms before retry #${retries + 1}...`);
-      await delay(waitMs);
-      resp = await fetch(url, { headers });
-      retries++;
+    if (resp.status === 429) {
+      v1FailedWith429 = true;
+      await logIssue(env, `Lodgify API v1 HTTP 429 – automatikus átváltás Lodgify API v2-re...`);
+      break;
     }
 
     if (!resp.ok) {
@@ -436,7 +448,57 @@ async function updateAllBookings(env) {
     allItems.push(...data.items);
     if (data.items.length < limit) break;
     offset += limit;
-    await delay(200);
+    await delay(350);
+  }
+
+  const notesMap = new Map();
+  if (v1FailedWith429) {
+    // Teljes fallback Lodgify API v2-re (ez tartalmazza a foglalásokat és a jegyzeteket is)
+    usedVersion = "v2-fallback";
+    allItems.length = 0;
+    let v2Page = 1;
+    while (v2Page <= 8) {
+      const v2Url = `https://api.lodgify.com/v2/reservations/bookings?page=${v2Page}&size=50&trash=False&includeExternal=true`;
+      const v2Resp = await fetchLodgifyWithRetry(v2Url, headers, env, `Lodgify v2 (page=${v2Page})`);
+      if (!v2Resp.ok) {
+        if (allItems.length > 0) break;
+        throw new Error(`Lodgify API v1 (429) és v2 (HTTP ${v2Resp.status}) is sikertelen`);
+      }
+      const v2Data = await v2Resp.json();
+      if (!v2Data || !v2Data.items || !v2Data.items.length) break;
+      for (const it of v2Data.items) {
+        const dep = it.departure ? String(it.departure).slice(0, 10) : "";
+        if (!dep || dep >= periodStart) {
+          allItems.push(it);
+        }
+        const noteText = cleanNote(it.notes);
+        if (noteText) notesMap.set(String(it.id).replace('.0', ''), noteText);
+      }
+      if (v2Data.items.length < 50) break;
+      v2Page++;
+      await delay(350);
+    }
+  } else {
+    // Notes lekérése Lodgify v2 API-ból (csak ha v1 sikeres volt)
+    try {
+      let v2Page = 1;
+      while (v2Page <= 3) {
+        const v2Url = `https://api.lodgify.com/v2/reservations/bookings?page=${v2Page}&size=50&trash=False`;
+        const v2Resp = await fetchLodgifyWithRetry(v2Url, headers, env, `Lodgify v2 notes (page=${v2Page})`);
+        if (!v2Resp.ok) break;
+        const v2Data = await v2Resp.json();
+        if (!v2Data || !v2Data.items || !v2Data.items.length) break;
+        for (const it of v2Data.items) {
+          const noteText = cleanNote(it.notes);
+          if (noteText) notesMap.set(String(it.id).replace('.0', ''), noteText);
+        }
+        if (v2Data.items.length < 50) break;
+        v2Page++;
+        await delay(300);
+      }
+    } catch (err) {
+      console.warn("Worker v2 notes fetch warning:", err.message);
+    }
   }
 
   // Szűrés: Csak az aktív 'Booked' állapotú foglalások és zárt időszakok (Declined, Cancelled, töröltek kizárva)
@@ -445,52 +507,30 @@ async function updateAllBookings(env) {
     return status === "booked" && !item.cancellationDate && !item.is_deleted;
   });
 
-  // Notes lekérése Lodgify v2 API-ból
-  const notesMap = new Map();
-  try {
-    let v2Page = 1;
-    while (v2Page <= 3) {
-      const v2Url = `https://api.lodgify.com/v2/reservations/bookings?page=${v2Page}&size=50&trash=False`;
-      const v2Resp = await fetch(v2Url, { headers });
-      if (!v2Resp.ok) break;
-      const v2Data = await v2Resp.json();
-      if (!v2Data || !v2Data.items || !v2Data.items.length) break;
-      for (const it of v2Data.items) {
-        const noteText = cleanNote(it.notes);
-        if (noteText) notesMap.set(String(it.id).replace('.0', ''), noteText);
-      }
-      if (v2Data.items.length < 50) break;
-      v2Page++;
-    }
-  } catch (err) {
-    console.warn("Worker v2 notes fetch warning:", err.message);
-  }
-
-  // Airbnb Lockbox kódok és részletek lekérése (Suggested Door Code)
+  // Airbnb Lockbox kódok és részletek lekérése (kíméletes soros lekérés 429 ellen!)
   const extraDetailsMap = new Map();
   const today = new Date().toISOString().slice(0, 10);
   const needsV2Detail = validBookings.filter(item => {
-    const id = String(item.id).replace('.0', '');
     const hasPhone = item.guest && item.guest.phone;
     const hasRoomCode = item.rooms && item.rooms[0]?.key_code;
     return item.type === "Booking" && item.departure >= today && (!hasPhone && !hasRoomCode);
-  });
+  }).slice(0, 8);
 
-  if (needsV2Detail.length > 0) {
-    await Promise.all(needsV2Detail.map(async item => {
-      const id = String(item.id).replace('.0', '');
-      try {
-        const resp = await fetch(`https://api.lodgify.com/v2/reservations/bookings/${id}`, { headers });
-        if (resp.ok) {
-          const detail = await resp.json();
-          extraDetailsMap.set(id, detail);
-          const noteText = cleanNote(detail.notes);
-          if (noteText && !notesMap.has(id)) {
-            notesMap.set(id, noteText);
-          }
+  for (const item of needsV2Detail) {
+    const id = String(item.id).replace('.0', '');
+    try {
+      const resp = await fetch(`https://api.lodgify.com/v2/reservations/bookings/${id}`, { headers });
+      if (resp.status === 429) break;
+      if (resp.ok) {
+        const detail = await resp.json();
+        extraDetailsMap.set(id, detail);
+        const noteText = cleanNote(detail.notes);
+        if (noteText && !notesMap.has(id)) {
+          notesMap.set(id, noteText);
         }
-      } catch (_) {}
-    }));
+      }
+      await delay(300);
+    } catch (_) {}
   }
 
   const mappedRows = validBookings.map(item => mapBooking(item, PROPERTIES_MAP, notesMap, extraDetailsMap));
@@ -506,8 +546,8 @@ async function updateAllBookings(env) {
     }
   }
 
-  await logIssue(env, `✅ Lodgify szinkronizáció sikeres: ${mappedRows.length} aktív foglalás és időszak frissítve.`);
-  return { success: true, count: mappedRows.length, version: "v1" };
+  await logIssue(env, `✅ Lodgify szinkronizáció sikeres (${usedVersion}): ${mappedRows.length} aktív foglalás és időszak frissítve.`);
+  return { success: true, count: mappedRows.length, version: usedVersion };
 }
 
 // --------------------- Mapping and Batch Upsert ---------------------
@@ -633,7 +673,7 @@ async function sendNewBookingWhatsAppNotifications(env, unnotifiedBookings) {
     if (!isGolf && !isArena) continue;
 
     const areaName = isArena ? "La Arena" : "Golf del Sur";
-    const recipients = [FERI_WHATSAPP];
+    const recipients = [];
     if (isGolf) recipients.push(GOLF_DEL_SUR_CLEANER_WHATSAPP);
     if (isArena) recipients.push(LA_ARENA_CLEANER_WHATSAPP);
 
@@ -782,7 +822,7 @@ async function sendCancelledBookingWhatsAppNotifications(env, cancelledBookings)
     if (!isGolf && !isArena) continue;
 
     const areaName = isArena ? "La Arena" : "Golf del Sur";
-    const recipients = [FERI_WHATSAPP];
+    const recipients = [];
     if (isGolf) recipients.push(GOLF_DEL_SUR_CLEANER_WHATSAPP);
     if (isArena) recipients.push(LA_ARENA_CLEANER_WHATSAPP);
 
@@ -2462,8 +2502,13 @@ async function triggerSync() {
     const msgTxt = await resp.text();
 
     if (resp.ok) {
-      showToast('✅ ' + msgTxt);
-      setTimeout(() => location.reload(), 1200);
+      if (msgTxt.startsWith('GH_DISPATCHED|')) {
+        showToast(msgTxt.slice('GH_DISPATCHED|'.length));
+        setTimeout(() => location.reload(), 15000);
+      } else {
+        showToast('✅ ' + msgTxt);
+        setTimeout(() => location.reload(), 1200);
+      }
     } else {
       showToast(msgTxt);
       btn.disabled = false;

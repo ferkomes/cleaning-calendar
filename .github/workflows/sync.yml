@@ -1,0 +1,22 @@
+name: Sync Lodgify Bookings
+
+on:
+  schedule:
+    # Reggel, délben és este (UTC 07:00, 12:00, 18:00 -> CET 08:00, 13:00, 19:00)
+    - cron: "0 7,12,18 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run Lodgify -> D1 sync
+        run: node sync.js

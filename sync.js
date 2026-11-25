@@ -238,8 +238,8 @@ async function sync() {
 
         const targetEmails = isLaArena ? LA_ARENA_NOTIFICATION_EMAILS : GOLF_DEL_SUR_NOTIFICATION_EMAILS;
         const targetWhatsApp = isLaArena 
-          ? [FERI_WHATSAPP, LA_ARENA_CLEANER_WHATSAPP]
-          : [FERI_WHATSAPP, GOLF_DEL_SUR_CLEANER_WHATSAPP];
+          ? [LA_ARENA_CLEANER_WHATSAPP]
+          : [GOLF_DEL_SUR_CLEANER_WHATSAPP];
 
         const areaName = isLaArena ? "La Arena" : "Golf del Sur";
 
